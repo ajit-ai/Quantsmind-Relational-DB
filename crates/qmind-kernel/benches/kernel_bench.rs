@@ -53,7 +53,7 @@ fn bench_wal_group_commit(c: &mut Criterion) {
                 w.append(&WalRecord::Put {
                     txn: i,
                     key: format!("key-{i}").into_bytes(),
-                    value: i,
+                    value: i.to_le_bytes().to_vec(),
                 });
             }
             w.commit_group().unwrap()
