@@ -180,11 +180,11 @@ impl MvccStore {
         if !pending.writes.is_empty() {
             let mut recs = Vec::with_capacity(pending.writes.len() + 2);
             recs.push(WalRecord::Begin { txn });
-            for value in pending.writes.values() {
-                recs.push(WalRecord::Insert {
+            for (key, value) in &pending.writes {
+                recs.push(WalRecord::Put {
                     txn,
-                    page: encode_value(*value),
-                    slot: 0,
+                    key: key.clone(),
+                    value: *value,
                 });
             }
             recs.push(WalRecord::Commit { txn });
@@ -213,11 +213,6 @@ impl MvccStore {
     pub fn commit_watermark(&self) -> u64 {
         self.mgr.commit_watermark()
     }
-}
-
-/// Placeholder mapping until row payloads live in heap pages (M2b).
-fn encode_value(v: u64) -> u64 {
-    v
 }
 
 #[cfg(test)]

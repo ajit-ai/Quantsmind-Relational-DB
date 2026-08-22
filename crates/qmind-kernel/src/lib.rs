@@ -20,5 +20,6 @@ pub mod wal;
 pub use btree::BTree;
 pub use buffer::{BufferPool, PageStore, RamPageStore};
 pub use error::{Error, Result};
+pub use mvcc::{Conflict, IsolationLevel, MvccStore, Snapshot};
 pub use page::{Page, PageHeader, PageId, PAGE_SIZE};
 pub use wal::{Lsn, WalReader, WalRecord, WalWriter};

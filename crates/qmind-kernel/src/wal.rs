@@ -16,8 +16,8 @@ pub type TxnId = u64;
 
 const MAX_RECORD_BYTES: usize = 1 << 20;
 
-/// Physiological log record. Payloads reference pages/row ids, not raw bytes,
-/// so replay stays valid across minor format versions (D-003).
+/// Physiological log record. Payloads reference keys/values, not raw page
+/// bytes, so replay stays valid across minor format versions (D-003).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalRecord {
     Begin {
@@ -29,11 +29,11 @@ pub enum WalRecord {
     Abort {
         txn: TxnId,
     },
-    /// Row inserted into heap page `page` at slot `slot`.
-    Insert {
+    /// Key-value write performed by `txn`.
+    Put {
         txn: TxnId,
-        page: u64,
-        slot: u16,
+        key: Vec<u8>,
+        value: u64,
     },
 }
 
@@ -52,11 +52,12 @@ impl WalRecord {
                 out.push(2);
                 out.extend_from_slice(&txn.to_le_bytes());
             }
-            WalRecord::Insert { txn, page, slot } => {
+            WalRecord::Put { txn, key, value } => {
                 out.push(3);
                 out.extend_from_slice(&txn.to_le_bytes());
-                out.extend_from_slice(&page.to_le_bytes());
-                out.extend_from_slice(&slot.to_le_bytes());
+                out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                out.extend_from_slice(key);
+                out.extend_from_slice(&value.to_le_bytes());
             }
         }
     }
@@ -66,31 +67,50 @@ impl WalRecord {
             at: 0,
             reason: "empty payload".into(),
         })?;
-        let need = match tag {
-            0..=2 => 9,
-            3 => 19,
-            other => {
-                return Err(Error::WalCorrupt {
-                    at: 0,
-                    reason: format!("unknown tag {other}"),
+        match tag {
+            0..=2 => {
+                if buf.len() != 9 {
+                    return Err(Error::WalCorrupt {
+                        at: 0,
+                        reason: format!("payload len {} != expected 9", buf.len()),
+                    });
+                }
+                let txn = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+                Ok(match tag {
+                    0 => WalRecord::Begin { txn },
+                    1 => WalRecord::Commit { txn },
+                    _ => WalRecord::Abort { txn },
                 })
             }
-        };
-        if buf.len() != need {
-            return Err(Error::WalCorrupt {
+            3 => {
+                // [tag u8][txn u64][klen u32][key][value u64]
+                if buf.len() < 21 {
+                    return Err(Error::WalCorrupt {
+                        at: 0,
+                        reason: "Put payload too short".into(),
+                    });
+                }
+                let txn = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+                let klen = u32::from_le_bytes(buf[9..13].try_into().unwrap()) as usize;
+                if buf.len() != 13 + klen + 8 {
+                    return Err(Error::WalCorrupt {
+                        at: 0,
+                        reason: format!(
+                            "Put payload len {} != expected {}",
+                            buf.len(),
+                            13 + klen + 8
+                        ),
+                    });
+                }
+                Ok(WalRecord::Put {
+                    txn,
+                    key: buf[13..13 + klen].to_vec(),
+                    value: u64::from_le_bytes(buf[13 + klen..].try_into().unwrap()),
+                })
+            }
+            other => Err(Error::WalCorrupt {
                 at: 0,
-                reason: format!("payload len {} != expected {need}", buf.len()),
-            });
-        }
-        let txn = u64::from_le_bytes(buf[1..9].try_into().unwrap());
-        match tag {
-            0 => Ok(WalRecord::Begin { txn }),
-            1 => Ok(WalRecord::Commit { txn }),
-            2 => Ok(WalRecord::Abort { txn }),
-            _ => Ok(WalRecord::Insert {
-                txn,
-                page: u64::from_le_bytes(buf[9..17].try_into().unwrap()),
-                slot: u16::from_le_bytes(buf[17..19].try_into().unwrap()),
+                reason: format!("unknown tag {other}"),
             }),
         }
     }
@@ -118,7 +138,7 @@ impl fmt::Display for WalRecord {
             WalRecord::Begin { txn } => write!(f, "begin t{txn}"),
             WalRecord::Commit { txn } => write!(f, "commit t{txn}"),
             WalRecord::Abort { txn } => write!(f, "abort t{txn}"),
-            WalRecord::Insert { txn, page, slot } => write!(f, "insert t{txn} p{page}s{slot}"),
+            WalRecord::Put { txn, key, value } => write!(f, "put t{txn} k{key:?}={value}"),
         }
     }
 }
@@ -282,18 +302,18 @@ mod tests {
     fn sample_records() -> Vec<WalRecord> {
         vec![
             WalRecord::Begin { txn: 7 },
-            WalRecord::Insert {
+            WalRecord::Put {
                 txn: 7,
-                page: 42,
-                slot: 3,
+                key: b"order:42".to_vec(),
+                value: 3,
             },
             WalRecord::Commit { txn: 7 },
             WalRecord::Abort { txn: 9 },
             WalRecord::Begin { txn: 11 },
-            WalRecord::Insert {
+            WalRecord::Put {
                 txn: 11,
-                page: 43,
-                slot: 65535,
+                key: vec![0xFF; 300],
+                value: u64::MAX,
             },
             WalRecord::Commit { txn: 11 },
         ]
@@ -327,10 +347,10 @@ mod tests {
         let sink = CountingSink::new();
         let mut w = WalWriter::new(sink);
         for i in 0..1000u64 {
-            w.append(&WalRecord::Insert {
+            w.append(&WalRecord::Put {
                 txn: i,
-                page: i,
-                slot: 0,
+                key: format!("k{i}").into_bytes(),
+                value: i,
             });
         }
         assert_eq!(w.pending_records(), 1000);
@@ -392,10 +412,10 @@ mod tests {
         {
             let mut w = WalWriter::new(&mut sink);
             for i in 0..10u64 {
-                w.append(&WalRecord::Insert {
+                w.append(&WalRecord::Put {
                     txn: i,
-                    page: i,
-                    slot: 1,
+                    key: format!("k{i}").into_bytes(),
+                    value: i,
                 });
             }
             w.commit_group().unwrap();
@@ -429,13 +449,13 @@ mod tests {
     #[test]
     fn display_is_stable() {
         assert_eq!(
-            WalRecord::Insert {
+            WalRecord::Put {
                 txn: 3,
-                page: 5,
-                slot: 9
+                key: b"ab".to_vec(),
+                value: 7
             }
             .to_string(),
-            "insert t3 p5s9"
+            "put t3 k[97, 98]=7"
         );
     }
 }
