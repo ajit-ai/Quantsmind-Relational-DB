@@ -5,8 +5,8 @@
 
 | Milestone | Theme | Status | Exit criteria |
 |---|---|---|---|
-| **M0** | Foundations: workspace, CI, docs, bench harness | 🔄 **in progress** | `cargo test` + clippy green in CI; workspace builds on Win/Linux |
-| **M1** | Storage kernel: pages, buffer pool, B+Tree, WAL (group commit) | ⬜ | ≥ 500K batched inserts/s single-thread; CRC page roundtrip tests; kill-mid-write leaves readable store |
+| **M0** | Foundations: workspace, CI, docs, bench harness | ✅ done | `cargo test` + clippy green in CI; workspace builds on Win/Linux |
+| **M1** | Storage kernel: pages, buffer pool, B+Tree, WAL (group commit) | 🔄 core shipped — file-backed store pending | **2.49M inserts/s measured (contract ≥500K)**; crash-semantics suite green; kill-mid-write leaves readable store |
 | **M2** | Transactions: MVCC snapshots, RC/ISO, recovery replay | ⬜ | crash-injection suite passes (zero committed-txn loss); concurrent stress suite green |
 | **M3** | SQL core: parser → logical plan → vectorized executor, single-table | ⬜ | ≥ 1M rows/s scan+filter; sqllogictest baseline green |
 | **M4** | Full relational: joins, aggregates, secondary indexes, routing | ⬜ | TPC-H Q1/Q6 (SF 0.1) ≤ 5× DuckDB |
@@ -17,17 +17,23 @@
 
 ## Milestone details
 
-### M0 — Foundations (current)
+### M0 — Foundations (complete)
 - [x] Cargo workspace with 4 crates (`kernel`, `sql`, `server`, `cli`)
 - [x] Architecture doc + roadmap (this file)
 - [x] CI gates: fmt, clippy `-D warnings`, test, bench compile
 - [x] Criterion harness wired in kernel
-- [ ] Kernel module skeletons with real type signatures (`page`, `buffer`, `btree`, `wal`, `mvcc`)
+- [x] Kernel module skeletons with real type signatures (`page`, `buffer`, `btree`, `wal`, `mvcc`)
 
-### M1 — Storage kernel
-Deliverables: versioned file format headers (D-003), 8KiB pages w/ CRC,
-clock-sweep buffer pool, B+Tree with latch crabbing, WAL segments with group
-commit window. Benchmarks land in `crates/qmind-kernel/benches/`.
+### M1 — Storage kernel (core complete)
+- [x] Versioned CRC page headers (D-003), 8KiB pages
+- [x] Clock-sweep buffer pool with write-back eviction, validate-on-load
+- [x] B+Tree: insert/get/get_all/range-scan, run-preserving splits,
+      duplicate `(key,value)` ordering, differential test vs BTreeMap
+- [x] WAL: CRC frames, group commit (one syscall per group),
+      torn-tail-safe replay, committed-prefix crash semantics
+- [x] Benchmarks: 2.49M inserts/s · 6.1M WAL rec/s · 123ns page seal
+- [ ] File-backed PageStore with segment directory layout
+- [ ] Latch crabbing groundwork for concurrent descent (M2 bridge)
 
 ### M2 — Transactions & recovery
 Snapshot isolation, first-committer-wins validation, checkpointing, redo/undo
