@@ -359,7 +359,7 @@ export default function App() {
         ) : (
           <div className="flex flex-col items-center gap-3">
             <Loader2 className="h-8 w-8 animate-spin text-accent" />
-            <p className="text-sm text-muted">Starting Quantsmind database engine…</p>
+            <p className="text-sm text-muted">Starting database engine…</p>
           </div>
         )}
       </div>
@@ -377,7 +377,19 @@ export default function App() {
         hasSql={!!(currentTab.kind === 'query' && (currentTab as { kind: 'query'; sql?: string }).sql)}
       />
 
-      {/* Top bar */}
+      {/* Branding Header - Moved to top right corner */}
+      <div className="flex items-center justify-end border-b border-base bg-surface px-4 py-2 shadow-sm">
+        <div className="flex items-center gap-2.5">
+          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent">
+            <Database className="h-4 w-4 text-accent-contrast" />
+          </div>
+          <div>
+            <h1 className="text-sm font-bold tracking-tight text-primary">QuantsMind Relational Studio</h1>
+          </div>
+        </div>
+      </div>
+
+      {/* Top bar - removed branding */}
       <header className="flex items-center justify-between border-b border-base bg-surface px-4 py-2 shadow-sm">
         <div className="flex items-center gap-2.5">
           <button
@@ -387,13 +399,6 @@ export default function App() {
           >
             <PanelLeft className="h-4 w-4" />
           </button>
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent">
-            <Database className="h-4 w-4 text-accent-contrast" />
-          </div>
-          <div>
-            <h1 className="text-sm font-bold tracking-tight text-primary">Quantsmind</h1>
-            <p className="text-[10px] text-muted">Relational Database Studio</p>
-          </div>
         </div>
         <div className="flex items-center gap-2">
           <span className="hidden items-center gap-1.5 rounded-full border border-success bg-success-light px-2.5 py-1 text-xs text-success sm:flex">
@@ -601,8 +606,7 @@ export default function App() {
         <div className="flex items-center gap-4">
           <span className="flex items-center gap-1.5">
             <Database className="h-3 w-3 text-accent" />
-            <span className="text-secondary">Quantsmind</span>
-            <span>· IndexedDB (PGlite)</span>
+            <span>IndexedDB (PGlite)</span>
           </span>
           <span>
             Schema: <span className="text-secondary">{activeSchema}</span>
