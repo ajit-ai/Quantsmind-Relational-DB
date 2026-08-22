@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["QuantsMind contributors"]
+
+[workspace.dependencies]
+qmind-kernel = { path = "crates/qmind-kernel" }
+qmind-sql = { path = "crates/qmind-sql" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
