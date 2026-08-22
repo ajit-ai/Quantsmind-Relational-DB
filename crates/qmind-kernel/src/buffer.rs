@@ -117,6 +117,11 @@ impl<S: PageStore> BufferPool<S> {
         &mut self.store
     }
 
+    /// Consume the pool and reclaim its durable store (simulated restart).
+    pub fn store_owned(self) -> S {
+        self.store
+    }
+
     pub fn resident_pages(&self) -> usize {
         self.frames.len()
     }
