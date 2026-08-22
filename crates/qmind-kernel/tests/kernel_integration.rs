@@ -4,6 +4,10 @@ use qmind_kernel::wal::{WalReader, WalRecord, WalWriter};
 use qmind_kernel::{BufferPool, MvccStore, PageHeader};
 use std::io::Cursor;
 
+type CommittedRow = (Vec<u8>, Vec<u8>);
+type OpenTxnWrites = std::collections::HashMap<u64, Vec<CommittedRow>>;
+
+
 #[test]
 fn flushed_store_survives_pool_replacement() {
     let mut pool = BufferPool::in_memory(2);
@@ -60,8 +64,7 @@ fn replay_recovers_exactly_the_committed_row_set() {
 
     // Recovery model: buffer each txn's writes; only Commit publishes them.
     let mut committed = std::collections::HashMap::new();
-    let mut open: std::collections::HashMap<u64, Vec<(Vec<u8>, Vec<u8>)>> =
-        std::collections::HashMap::new();
+    let mut open: OpenTxnWrites = std::collections::HashMap::new();
     for (_, rec) in &replay.records {
         match rec {
             WalRecord::Begin { txn } => {
@@ -129,8 +132,7 @@ fn mvcc_commit_rides_wal_and_recovery_rebuilds_state() {
     assert!(!replay.torn_tail);
 
     let mut recovered = MvccStore::new();
-    let mut open: std::collections::HashMap<u64, Vec<(Vec<u8>, Vec<u8>)>> =
-        std::collections::HashMap::new();
+    let mut open: OpenTxnWrites = std::collections::HashMap::new();
     for (_, rec) in &replay.records {
         match rec {
             WalRecord::Begin { txn } => {
