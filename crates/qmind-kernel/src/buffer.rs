@@ -9,14 +9,14 @@ use crate::error::{Error, Result};
 use crate::page::{PageHeader, PageId, PAGE_SIZE};
 use std::collections::HashMap;
 
-/// Durable page storage. M1 ships a RAM store; the file-backed segment store
-/// lands later in M1 (versioned headers per D-003).
+/// Durable page storage. M1 ships RAM + file-backed stores; segment layout
+/// is versioned per D-003.
 pub trait PageStore {
-    fn read_page(&self, id: PageId, buf: &mut [u8]) -> Result<()>;
+    fn read_page(&mut self, id: PageId, buf: &mut [u8]) -> Result<()>;
     fn write_page(&mut self, id: PageId, buf: &[u8]) -> Result<()>;
     /// Durability barrier for all previously written pages.
-    fn sync(&self) -> Result<()>;
-    fn contains(&self, id: PageId) -> bool;
+    fn sync(&mut self) -> Result<()>;
+    fn contains(&mut self, id: PageId) -> bool;
 }
 
 /// In-memory store for tests and benchmarks.
@@ -32,7 +32,7 @@ impl RamPageStore {
 }
 
 impl PageStore for RamPageStore {
-    fn read_page(&self, id: PageId, buf: &mut [u8]) -> Result<()> {
+    fn read_page(&mut self, id: PageId, buf: &mut [u8]) -> Result<()> {
         let src = self
             .pages
             .get(&id)
@@ -50,11 +50,11 @@ impl PageStore for RamPageStore {
         Ok(())
     }
 
-    fn sync(&self) -> Result<()> {
+    fn sync(&mut self) -> Result<()> {
         Ok(())
     }
 
-    fn contains(&self, id: PageId) -> bool {
+    fn contains(&mut self, id: PageId) -> bool {
         self.pages.contains_key(&id)
     }
 }
@@ -80,6 +80,13 @@ impl Frame {
             ref_bit: true,
             dirty: false,
         }
+    }
+
+    /// Re-seal the full-page checksum over current contents. The pool owns
+    /// the header (it lives inside `data`), so this runs before every durable
+    /// write of a dirty frame.
+    fn seal(&mut self) {
+        PageHeader::new(self.page_id).encode_into(self.data.as_mut());
     }
 }
 
@@ -202,6 +209,7 @@ impl<S: PageStore> BufferPool<S> {
         let mut n = 0;
         for f in self.frames.iter_mut() {
             if f.dirty {
+                f.seal();
                 self.store.write_page(f.page_id, f.data.as_ref())?;
                 f.dirty = false;
                 n += 1;
@@ -231,7 +239,7 @@ impl<S: PageStore> BufferPool<S> {
             self.hand = idx + 1;
         }
         let v = victim.ok_or(Error::NoEvictableFrame)?;
-        let frame = self.frames.swap_remove(v);
+        let mut frame = self.frames.swap_remove(v);
         self.map.remove(&frame.page_id);
         // swap_remove relocated the tail frame into slot `v` — re-point it.
         if v < self.frames.len() {
@@ -239,6 +247,7 @@ impl<S: PageStore> BufferPool<S> {
             self.map.insert(moved, v);
         }
         if frame.dirty {
+            frame.seal();
             self.store.write_page(frame.page_id, frame.data.as_ref())?;
         }
         if !self.frames.is_empty() {
