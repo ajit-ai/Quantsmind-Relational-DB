@@ -37,7 +37,7 @@ fn replay_recovers_exactly_the_committed_row_set() {
             w.append(&WalRecord::Put {
                 txn: 1,
                 key: format!("row{row}").into_bytes(),
-                value: row,
+                value: row.to_le_bytes().to_vec(),
             });
         }
         w.append(&WalRecord::Commit { txn: 1 });
@@ -46,7 +46,7 @@ fn replay_recovers_exactly_the_committed_row_set() {
         w.append(&WalRecord::Put {
             txn: 2,
             key: b"aborted".to_vec(),
-            value: 200,
+            value: vec![200],
         });
         w.append(&WalRecord::Abort { txn: 2 });
         w.commit_group().unwrap();
@@ -60,7 +60,7 @@ fn replay_recovers_exactly_the_committed_row_set() {
 
     // Recovery model: buffer each txn's writes; only Commit publishes them.
     let mut committed = std::collections::HashMap::new();
-    let mut open: std::collections::HashMap<u64, Vec<(Vec<u8>, u64)>> =
+    let mut open: std::collections::HashMap<u64, Vec<(Vec<u8>, Vec<u8>)>> =
         std::collections::HashMap::new();
     for (_, rec) in &replay.records {
         match rec {
@@ -69,7 +69,7 @@ fn replay_recovers_exactly_the_committed_row_set() {
             }
             WalRecord::Put { txn, key, value } => {
                 if let Some(rows) = open.get_mut(txn) {
-                    rows.push((key.clone(), *value));
+                    rows.push((key.clone(), value.clone()));
                 }
             }
             WalRecord::Commit { txn } => {
@@ -85,7 +85,10 @@ fn replay_recovers_exactly_the_committed_row_set() {
 
     assert_eq!(committed.len(), 5);
     for row in 100..105u64 {
-        assert_eq!(committed.get(format!("row{row}").as_bytes()), Some(&row));
+        assert_eq!(
+            committed.get(format!("row{row}").as_bytes()),
+            Some(&row.to_le_bytes().to_vec())
+        );
     }
     assert!(!committed.contains_key(b"aborted".as_slice()));
 }
@@ -99,7 +102,11 @@ fn mvcc_commit_rides_wal_and_recovery_rebuilds_state() {
         let mut wal = WalWriter::new(&mut sink);
         for i in 0..50u64 {
             let (t, _) = db.begin();
-            db.set(t, format!("key{i}").as_bytes(), i * 1000);
+            db.set(
+                t,
+                format!("key{i}").as_bytes(),
+                (i * 1000).to_le_bytes().to_vec(),
+            );
             let logged = db
                 .commit::<()>(t, |recs| {
                     for r in recs {
@@ -112,7 +119,7 @@ fn mvcc_commit_rides_wal_and_recovery_rebuilds_state() {
         }
         // Crash with an uncommitted group buffered.
         let (t, _) = db.begin();
-        db.set(t, b"lost", 999);
+        db.set(t, b"lost", vec![9, 9, 9]);
         drop(wal); // "lost" never reached the sink
         db.abort(t);
     }
@@ -122,7 +129,7 @@ fn mvcc_commit_rides_wal_and_recovery_rebuilds_state() {
     assert!(!replay.torn_tail);
 
     let mut recovered = MvccStore::new();
-    let mut open: std::collections::HashMap<u64, Vec<(Vec<u8>, u64)>> =
+    let mut open: std::collections::HashMap<u64, Vec<(Vec<u8>, Vec<u8>)>> =
         std::collections::HashMap::new();
     for (_, rec) in &replay.records {
         match rec {
@@ -131,7 +138,7 @@ fn mvcc_commit_rides_wal_and_recovery_rebuilds_state() {
             }
             WalRecord::Put { txn, key, value } => {
                 if let Some(rows) = open.get_mut(txn) {
-                    rows.push((key.clone(), *value));
+                    rows.push((key.clone(), value.clone()));
                 }
             }
             WalRecord::Commit { txn } => {
@@ -153,7 +160,7 @@ fn mvcc_commit_rides_wal_and_recovery_rebuilds_state() {
     for i in 0..50u64 {
         assert_eq!(
             recovered.get(check, format!("key{i}").as_bytes(), &csnap),
-            Some(i * 1000)
+            Some((i * 1000).to_le_bytes().to_vec())
         );
     }
     assert_eq!(recovered.get(check, b"lost", &csnap), None);

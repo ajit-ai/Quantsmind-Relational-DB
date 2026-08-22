@@ -33,7 +33,7 @@ pub enum WalRecord {
     Put {
         txn: TxnId,
         key: Vec<u8>,
-        value: u64,
+        value: Vec<u8>,
     },
 }
 
@@ -57,7 +57,8 @@ impl WalRecord {
                 out.extend_from_slice(&txn.to_le_bytes());
                 out.extend_from_slice(&(key.len() as u32).to_le_bytes());
                 out.extend_from_slice(key);
-                out.extend_from_slice(&value.to_le_bytes());
+                out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                out.extend_from_slice(value);
             }
         }
     }
@@ -83,8 +84,8 @@ impl WalRecord {
                 })
             }
             3 => {
-                // [tag u8][txn u64][klen u32][key][value u64]
-                if buf.len() < 21 {
+                // [tag u8][txn u64][klen u32][key][vlen u32][value]
+                if buf.len() < 17 {
                     return Err(Error::WalCorrupt {
                         at: 0,
                         reason: "Put payload too short".into(),
@@ -92,20 +93,24 @@ impl WalRecord {
                 }
                 let txn = u64::from_le_bytes(buf[1..9].try_into().unwrap());
                 let klen = u32::from_le_bytes(buf[9..13].try_into().unwrap()) as usize;
-                if buf.len() != 13 + klen + 8 {
+                let vpos = 13 + klen;
+                if buf.len() < vpos + 4 {
                     return Err(Error::WalCorrupt {
                         at: 0,
-                        reason: format!(
-                            "Put payload len {} != expected {}",
-                            buf.len(),
-                            13 + klen + 8
-                        ),
+                        reason: "Put missing value length".into(),
+                    });
+                }
+                let vlen = u32::from_le_bytes(buf[vpos..vpos + 4].try_into().unwrap()) as usize;
+                if buf.len() != vpos + 4 + vlen {
+                    return Err(Error::WalCorrupt {
+                        at: 0,
+                        reason: format!("Put len {} != expected {}", buf.len(), vpos + 4 + vlen),
                     });
                 }
                 Ok(WalRecord::Put {
                     txn,
-                    key: buf[13..13 + klen].to_vec(),
-                    value: u64::from_le_bytes(buf[13 + klen..].try_into().unwrap()),
+                    key: buf[13..vpos].to_vec(),
+                    value: buf[vpos + 4..].to_vec(),
                 })
             }
             other => Err(Error::WalCorrupt {
@@ -138,7 +143,9 @@ impl fmt::Display for WalRecord {
             WalRecord::Begin { txn } => write!(f, "begin t{txn}"),
             WalRecord::Commit { txn } => write!(f, "commit t{txn}"),
             WalRecord::Abort { txn } => write!(f, "abort t{txn}"),
-            WalRecord::Put { txn, key, value } => write!(f, "put t{txn} k{key:?}={value}"),
+            WalRecord::Put { txn, key, value } => {
+                write!(f, "put t{txn} k{key:?}={}b", value.len())
+            }
         }
     }
 }
@@ -305,7 +312,7 @@ mod tests {
             WalRecord::Put {
                 txn: 7,
                 key: b"order:42".to_vec(),
-                value: 3,
+                value: vec![3, 1, 4, 1, 5],
             },
             WalRecord::Commit { txn: 7 },
             WalRecord::Abort { txn: 9 },
@@ -313,7 +320,7 @@ mod tests {
             WalRecord::Put {
                 txn: 11,
                 key: vec![0xFF; 300],
-                value: u64::MAX,
+                value: vec![0xFF; 300],
             },
             WalRecord::Commit { txn: 11 },
         ]
@@ -350,7 +357,7 @@ mod tests {
             w.append(&WalRecord::Put {
                 txn: i,
                 key: format!("k{i}").into_bytes(),
-                value: i,
+                value: i.to_le_bytes().to_vec(),
             });
         }
         assert_eq!(w.pending_records(), 1000);
@@ -415,7 +422,7 @@ mod tests {
                 w.append(&WalRecord::Put {
                     txn: i,
                     key: format!("k{i}").into_bytes(),
-                    value: i,
+                    value: i.to_le_bytes().to_vec(),
                 });
             }
             w.commit_group().unwrap();
@@ -452,10 +459,10 @@ mod tests {
             WalRecord::Put {
                 txn: 3,
                 key: b"ab".to_vec(),
-                value: 7
+                value: vec![7, 9]
             }
             .to_string(),
-            "put t3 k[97, 98]=7"
+            "put t3 k[97, 98]=2b"
         );
     }
 }

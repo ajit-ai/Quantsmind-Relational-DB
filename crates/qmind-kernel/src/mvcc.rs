@@ -85,14 +85,14 @@ impl TxnManager {
 #[derive(Debug, Clone)]
 struct Version {
     commit_ts: u64,
-    value: u64,
+    value: Vec<u8>,
 }
 
 /// Buffered state of an in-flight writer.
 #[derive(Debug)]
 struct Pending {
     snap: Snapshot,
-    writes: BTreeMap<Vec<u8>, u64>,
+    writes: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 /// Snapshot-isolated KV store.
@@ -122,10 +122,10 @@ impl MvccStore {
 
     /// Read `key` under `snap`, seeing the transaction's own buffered writes
     /// first (read-your-own-writes).
-    pub fn get(&self, txn: TxnId, key: &[u8], snap: &Snapshot) -> Option<u64> {
+    pub fn get(&self, txn: TxnId, key: &[u8], snap: &Snapshot) -> Option<Vec<u8>> {
         if let Some(p) = self.pending.get(&txn) {
             if let Some(v) = p.writes.get(key) {
-                return Some(*v);
+                return Some(v.clone());
             }
         }
         self.data
@@ -133,11 +133,11 @@ impl MvccStore {
             .iter()
             .rev()
             .find(|v| v.commit_ts <= snap.read_ts)
-            .map(|v| v.value)
+            .map(|v| v.value.clone())
     }
 
     /// Buffer a write inside the transaction.
-    pub fn set(&mut self, txn: TxnId, key: &[u8], value: u64) {
+    pub fn set(&mut self, txn: TxnId, key: &[u8], value: Vec<u8>) {
         self.pending
             .entry(txn)
             .or_insert_with(|| Pending {
@@ -184,7 +184,7 @@ impl MvccStore {
                 recs.push(WalRecord::Put {
                     txn,
                     key: key.clone(),
-                    value: *value,
+                    value: value.clone(),
                 });
             }
             recs.push(WalRecord::Commit { txn });
@@ -223,27 +223,27 @@ mod tests {
     fn snapshot_isolation_hides_uncommitted_and_future_writes() {
         let mut s = MvccStore::new();
         let (t0, _) = s.begin();
-        s.set(t0, b"k", 1);
+        s.set(t0, b"k", vec![1]);
         s.commit::<()>(t0, |_| Ok(())).unwrap().unwrap();
 
         let (reader, rsnap) = s.begin();
 
         let (t1, _) = s.begin();
-        s.set(t1, b"k", 2);
+        s.set(t1, b"k", vec![2]);
         assert_eq!(
             s.get(reader, b"k", &rsnap),
-            Some(1),
+            Some(vec![1]),
             "uncommitted invisible"
         );
         s.commit::<()>(t1, |_| Ok(())).unwrap().unwrap();
         assert_eq!(
             s.get(reader, b"k", &rsnap),
-            Some(1),
+            Some(vec![1]),
             "post-snapshot commit invisible under SI"
         );
 
         let (r2, s2) = s.begin();
-        assert_eq!(s.get(r2, b"k", &s2), Some(2));
+        assert_eq!(s.get(r2, b"k", &s2), Some(vec![2]));
     }
 
     #[test]
@@ -251,8 +251,8 @@ mod tests {
         let mut s = MvccStore::new();
         let (a, _sa) = s.begin();
         let (b, _sb) = s.begin();
-        s.set(a, b"x", 10);
-        s.set(b, b"x", 20);
+        s.set(a, b"x", vec![10]);
+        s.set(b, b"x", vec![20]);
         s.commit::<()>(a, |_| Ok(())).unwrap().unwrap();
 
         let res = s.commit::<()>(b, |_| Ok(())).unwrap();
@@ -260,7 +260,7 @@ mod tests {
 
         s.abort(b);
         let (c, sc) = s.begin();
-        assert_eq!(s.get(c, b"x", &sc), Some(10));
+        assert_eq!(s.get(c, b"x", &sc), Some(vec![10]));
     }
 
     #[test]
@@ -268,21 +268,21 @@ mod tests {
         let mut s = MvccStore::new();
         let (a, _) = s.begin();
         let (b, _) = s.begin();
-        s.set(a, b"k1", 1);
-        s.set(b, b"k2", 2);
+        s.set(a, b"k1", vec![1]);
+        s.set(b, b"k2", vec![2]);
         s.commit::<()>(a, |_| Ok(())).unwrap().unwrap();
         s.commit::<()>(b, |_| Ok(())).unwrap().unwrap();
         let (c, sc) = s.begin();
-        assert_eq!(s.get(c, b"k1", &sc), Some(1));
-        assert_eq!(s.get(c, b"k2", &sc), Some(2));
+        assert_eq!(s.get(c, b"k1", &sc), Some(vec![1]));
+        assert_eq!(s.get(c, b"k2", &sc), Some(vec![2]));
     }
 
     #[test]
     fn read_your_own_writes_and_abort_discards() {
         let mut s = MvccStore::new();
         let (t, snap) = s.begin();
-        s.set(t, b"mine", 42);
-        assert_eq!(s.get(t, b"mine", &snap), Some(42));
+        s.set(t, b"mine", vec![42]);
+        assert_eq!(s.get(t, b"mine", &snap), Some(vec![42]));
         s.abort(t);
         let (t2, s2) = s.begin();
         assert_eq!(s.get(t2, b"mine", &s2), None);
@@ -292,7 +292,7 @@ mod tests {
     fn wal_failure_rolls_back_publication() {
         let mut s = MvccStore::new();
         let (t, _) = s.begin();
-        s.set(t, b"z", 9);
+        s.set(t, b"z", vec![9]);
         let res: Result<Result<(), Conflict>, String> =
             s.commit(t, |_| Err(String::from("disk full")));
         assert!(res.is_err(), "sink failure must surface");
@@ -305,7 +305,7 @@ mod tests {
     fn aborted_writer_leaves_no_versions() {
         let mut s = MvccStore::new();
         let (t, _) = s.begin();
-        s.set(t, b"gone", 5);
+        s.set(t, b"gone", vec![5]);
         s.abort(t);
         let (r, rs) = s.begin();
         assert_eq!(s.get(r, b"gone", &rs), None);
@@ -316,8 +316,8 @@ mod tests {
     fn long_reader_holds_stable_view_across_other_commits() {
         let mut s = MvccStore::new();
         let (setup, _) = s.begin();
-        s.set(setup, b"a", 1);
-        s.set(setup, b"b", 1);
+        s.set(setup, b"a", 1i64.to_le_bytes().to_vec());
+        s.set(setup, b"b", 1i64.to_le_bytes().to_vec());
         s.commit::<()>(setup, |_| Ok(())).unwrap().unwrap();
 
         let (reader, rsnap) = s.begin();
@@ -326,13 +326,19 @@ mod tests {
         for i in 2..10u64 {
             let (w, _) = s.begin();
             let key = if i % 2 == 0 { b"a" as &[u8] } else { b"b" };
-            s.set(w, key, i);
+            s.set(w, key, i.to_le_bytes().to_vec());
             s.commit::<()>(w, |_| Ok(())).unwrap().unwrap();
         }
-        assert_eq!(s.get(reader, b"a", &rsnap), Some(1));
-        assert_eq!(s.get(reader, b"b", &rsnap), Some(1));
+        assert_eq!(
+            s.get(reader, b"a", &rsnap),
+            Some(1i64.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            s.get(reader, b"b", &rsnap),
+            Some(1i64.to_le_bytes().to_vec())
+        );
 
-        s.set(stale, b"a", 999);
+        s.set(stale, b"a", vec![99, 9]);
         let res = s.commit::<()>(stale, |_| Ok(())).unwrap();
         assert!(
             res.is_err(),
