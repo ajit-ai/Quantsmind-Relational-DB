@@ -19,4 +19,4 @@ pub mod wal;
 
 pub use error::{Error, Result};
 pub use page::{Page, PageHeader, PageId, PAGE_SIZE};
-pub use wal::Lsn;
+pub use wal::{Lsn, WalReader, WalRecord, WalWriter};
