@@ -52,7 +52,6 @@ impl std::ops::Deref for Page {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
 pub struct PageHeader {
     pub checksum: u32,
     pub page_id: PageId,
@@ -64,7 +63,16 @@ pub struct PageHeader {
 }
 
 impl PageHeader {
-    pub const SIZE: usize = std::mem::size_of::<PageHeader>();
+    /// Serialized little-endian with EXPLICIT offsets — never derive layout
+    /// from repr(C) (alignment padding shifts the checksum slot). Never
+    /// reorder fields without bumping `FORMAT_VERSION` (D-003).
+    pub const OFF_PAGE_ID: usize = 0;
+    pub const OFF_FORMAT_VERSION: usize = 8;
+    pub const OFF_FLAGS: usize = 10;
+    pub const OFF_USED: usize = 12;
+    pub const OFF_CHECKSUM: usize = 14;
+    /// 8 (page_id) + 2+2+2 (version, flags, used) + 4 (crc)
+    pub const SIZE: usize = Self::OFF_CHECKSUM + 4;
 
     pub fn new(page_id: PageId) -> Self {
         Self {
@@ -76,15 +84,17 @@ impl PageHeader {
         }
     }
 
-    /// Encode header into `buf[0..Self::SIZE]`.
+    /// Encode header into `buf[0..Self::SIZE]` and seal a checksum over the
+    /// full page (header fields + payload), skipping the checksum slot.
     pub fn encode_into(&self, buf: &mut [u8]) {
-        buf[..8].copy_from_slice(&self.page_id.to_le_bytes());
-        buf[8..10].copy_from_slice(&self.format_version.to_le_bytes());
-        buf[10..12].copy_from_slice(&self.flags.to_le_bytes());
-        buf[12..14].copy_from_slice(&self.used.to_le_bytes());
-        // checksum occupies the last 4 bytes of the header slot
+        buf[Self::OFF_PAGE_ID..8].copy_from_slice(&self.page_id.to_le_bytes());
+        buf[Self::OFF_FORMAT_VERSION..Self::OFF_FLAGS]
+            .copy_from_slice(&self.format_version.to_le_bytes());
+        buf[Self::OFF_FLAGS..Self::OFF_USED].copy_from_slice(&self.flags.to_le_bytes());
+        buf[Self::OFF_USED..Self::OFF_CHECKSUM].copy_from_slice(&self.used.to_le_bytes());
         let end = Self::SIZE;
-        let crc = crc32(&buf[0..end - 4]);
+        buf[end - 4..end].copy_from_slice(&[0, 0, 0, 0]);
+        let crc = crc32_skipping(buf);
         buf[end - 4..end].copy_from_slice(&crc.to_le_bytes());
     }
 
@@ -94,8 +104,10 @@ impl PageHeader {
         debug_assert!(buf.len() >= Self::SIZE);
         let end = Self::SIZE;
         let stored = u32::from_le_bytes(buf[end - 4..end].try_into().unwrap());
-        if stored != crc32(&buf[0..end - 4]) {
-            return Err(Error::ChecksumMismatch { page: 0 });
+        if stored != crc32_skipping(buf) {
+            return Err(Error::ChecksumMismatch {
+                page: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            });
         }
         let page = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let format_version = u16::from_le_bytes(buf[8..10].try_into().unwrap());
@@ -117,8 +129,10 @@ impl PageHeader {
 /// Storage format version. Bump policy documented before M1 ships (D-003).
 pub const FORMAT_VERSION: u16 = 1;
 
-/// CRC32 (IEEE). Placeholder until M1 swaps in a hardware-accelerated impl
-/// (crc32fast / PCLMULQDQ); signature stays identical.
+/// CRC32 (IEEE) over everything except the checksum slot itself
+/// (`[14..18)`), so payload corruption is caught on load. Placeholder until
+/// M2 swaps in a hardware-accelerated streaming impl (crc32fast / PCLMULQDQ);
+/// signature stays identical.
 pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in data {
@@ -126,6 +140,26 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
         for _ in 0..8 {
             let mask = (crc & 1).wrapping_neg();
             crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Whole-buffer CRC that skips the header checksum slot.
+fn crc32_skipping(buf: &[u8]) -> u32 {
+    const SKIP: std::ops::Range<usize> = PageHeader::OFF_CHECKSUM..PageHeader::SIZE;
+    if buf.len() <= SKIP.end {
+        return crc32(&buf[..SKIP.start]);
+    }
+    let mut crc: u32 = 0xFFFF_FFFF;
+    let parts: [&[u8]; 2] = [&buf[..SKIP.start], &buf[SKIP.end..]];
+    for chunk in parts {
+        for &b in chunk {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
         }
     }
     !crc
@@ -150,10 +184,23 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_page_is_rejected() {
+    fn corrupted_header_is_rejected() {
         let mut buf = [0u8; PAGE_SIZE];
         PageHeader::new(7).encode_into(&mut buf);
         buf[3] ^= 0xFF; // inside CRC-covered region [0..Self::SIZE-4]
+        assert!(matches!(
+            PageHeader::decode(&buf),
+            Err(Error::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn corrupted_payload_is_rejected() {
+        // Full-page checksum contract: silent payload corruption must fail
+        // validation at load time, not surface as garbage rows later.
+        let mut buf = [0u8; PAGE_SIZE];
+        PageHeader::new(8).encode_into(&mut buf);
+        buf[4096] ^= 0xFF;
         assert!(matches!(
             PageHeader::decode(&buf),
             Err(Error::ChecksumMismatch { .. })

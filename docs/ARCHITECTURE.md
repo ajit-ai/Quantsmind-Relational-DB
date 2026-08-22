@@ -78,7 +78,8 @@ Targets are re-validated each milestone release; regressions fail CI.
 ## 3. Kernel design
 
 ### 3.1 Pages & buffer pool (M1)
-- Fixed page size **8 KiB** (`page::PAGE_SIZE`); page = 24-byte typed header + payload.
+- Fixed page size **8 KiB** (`page::PAGE_SIZE`); page = 18-byte typed header + payload,
+  full-page CRC32 (header + payload, checksum slot excluded).
 - Checksummed headers (CRC32) — corruption detected at read, never propagated.
 - Buffer pool: configurable frame count, clock-sweep eviction, pin/unpin API,
   dirty-page tracking with checkpoint integration.
