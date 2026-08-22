@@ -119,7 +119,7 @@ pub const FORMAT_VERSION: u16 = 1;
 
 /// CRC32 (IEEE). Placeholder until M1 swaps in a hardware-accelerated impl
 /// (crc32fast / PCLMULQDQ); signature stays identical.
-fn crc32(data: &[u8]) -> u32 {
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in data {
         crc ^= b as u32;

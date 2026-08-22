@@ -18,6 +18,13 @@ pub enum Error {
     WalGap {
         at: Lsn,
     },
+    /// WAL record failed checksum or framing validation during replay.
+    WalCorrupt {
+        at: Lsn,
+        reason: String,
+    },
+    /// Every frame is pinned or referenced — pool capacity exhausted.
+    NoEvictableFrame,
     Io(std::io::Error),
     Other(String),
 }
@@ -28,6 +35,10 @@ impl fmt::Display for Error {
             Error::ChecksumMismatch { page } => write!(f, "checksum mismatch on page {page}"),
             Error::PageNotFound { page } => write!(f, "page {page} not found"),
             Error::WalGap { at } => write!(f, "gap in WAL at LSN {at}"),
+            Error::WalCorrupt { at, reason } => {
+                write!(f, "corrupt WAL record at LSN {at}: {reason}")
+            }
+            Error::NoEvictableFrame => write!(f, "buffer pool exhausted: all frames pinned"),
             Error::Io(e) => write!(f, "io error: {e}"),
             Error::Other(msg) => write!(f, "{msg}"),
         }
