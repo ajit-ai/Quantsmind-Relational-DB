@@ -1,0 +1,11 @@
+[package]
+name = "qmind-server"
+description = "QuantsMind server: Postgres wire protocol listener"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+qmind-kernel = { workspace = true }
+qmind-sql = { workspace = true }
