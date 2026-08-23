@@ -454,7 +454,7 @@ fn try_parse_aggregates(
         };
         let arg0: Option<FunctionArgExpr> = match &f.args {
             sqlparser::ast::FunctionArguments::None => None,
-            sqlparser::ast::FunctionArguments::Subquery(sq) => {
+            sqlparser::ast::FunctionArguments::Subquery(_) => {
                 return Err(format!("{fname}(subquery) unsupported"));
             }
             sqlparser::ast::FunctionArguments::List(l) => l.args.first().map(|a| match a {
