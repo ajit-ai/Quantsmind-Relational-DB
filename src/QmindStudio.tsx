@@ -5,7 +5,7 @@ interface Row { [k: string]: unknown }
 
 export default function QmindStudio() {
   const [sql, setSql] = useState(
-    "CREATE TABLE demo (id INTEGER NOT NULL, name TEXT);\nINSERT INTO demo VALUES (1,'Ada'),(2,'Grace');\nSELECT * FROM demo;"
+    "CREATE TABLE IF NOT EXISTS demo (id INTEGER NOT NULL, name TEXT);\nSELECT * FROM demo;"
   );
   const [out, setOut] = useState<string>('Engine ready — press Run.');
   const [grid, setGrid] = useState<{ cols: string[]; rows: Row[] } | null>(null);
@@ -15,12 +15,13 @@ export default function QmindStudio() {
     setBusy(true);
     setGrid(null);
     let last = '';
+    const msgs: string[] = [];
     for (const stmt of sql.split(';').map((s) => s.trim()).filter(Boolean)) {
       const res = await runSql(stmt + ';');
       if (!res.ok) {
+        msgs.push('ERROR: ' + res.error);
         last = 'ERROR: ' + res.error;
-        setGrid(null);
-        break;
+        continue; // keep executing the remaining statements
       }
       if (res.columns.length > 0) {
         setGrid({ cols: res.columns, rows: res.rows as unknown as Row[] });
@@ -29,7 +30,7 @@ export default function QmindStudio() {
         last = `OK — ${res.rowsAffected} row(s) affected`;
       }
     }
-    setOut(last);
+    setOut(msgs.length ? msgs.join('  ·  ') : last);
     setBusy(false);
   }
 
