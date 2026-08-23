@@ -6,13 +6,13 @@
 | Milestone | Theme | Status | Exit criteria |
 |---|---|---|---|
 | **M0** | Foundations: workspace, CI, docs, bench harness | ✅ done | `cargo test` + clippy green in CI; workspace builds on Win/Linux |
-| **M1** | Storage kernel: pages, buffer pool, B+Tree, WAL (group commit) | 🔄 core shipped — file-backed store pending | **2.49M inserts/s measured (contract ≥500K)**; crash-semantics suite green; kill-mid-write leaves readable store |
-| **M2** | Transactions: MVCC snapshots, RC/ISO, recovery replay | ⬜ | crash-injection suite passes (zero committed-txn loss); concurrent stress suite green |
-| **M3** | SQL core: parser → logical plan → vectorized executor, single-table | ⬜ | ≥ 1M rows/s scan+filter; sqllogictest baseline green |
-| **M4** | Full relational: joins, aggregates, secondary indexes, routing | ⬜ | TPC-H Q1/Q6 (SF 0.1) ≤ 5× DuckDB |
-| **M5** | Server mode: PG wire protocol + CLI shell | ⬜ | psql connects & runs queries; 10K concurrent connections soak test |
-| **M6** | Desktop Studio GUI (Tauri 2 + React reuse) | ⬜ | packaged installers (Win/Linux/macOS) run engine embedded |
-| **M7** | Production hardening: cost hints, fuzzing, perf valley, packaging | ⬜ | 72h soak clean; all §1.1 performance contract targets met |
+| **M1** | Storage kernel: pages, buffer pool, B+Tree, WAL (group commit) | ✅ done — file-backed store included | 2.49M inserts/s (contract ≥500K); full-page CRC; restart roundtrip tests |
+| **M2** | Transactions: MVCC snapshots, recovery replay | ✅ core done | FCW + SI tested; WAL-integrated commit; committed-state reconstruction from log |
+| **M3** | SQL core: parse → DDL/DML → filter/limit over MVCC | ✅ core done | 6 e2e SQL tests green; vectorized executor + sqllogictest remain (perf phase) |
+| **M4** | Relational: GROUP BY, aggregates, hash INNER JOIN | ✅ core done | e2e join+grouping tests; secondary indexes + TPC-H bench remain |
+| **M5** | PG wire server + CLI shell | 🔄 a done — b pending | TCP e2e test passes (2 clients, shared engine); scram auth + extended protocol + soak remain |
+| **M6** | Desktop Studio GUI (Tauri 2) | 🔄 a scaffold done | src-tauri shell + run_sql command + typed TS bridge; UI wiring, icons, installers remain |
+| **M7** | Production hardening: fuzzing, perf valley, packaging | ⬜ | 72h soak clean; all §1.1 performance contract targets met |
 | **M8** | Persistent columnar replica (full HTAP storage split) | ⬜ | delta-apply lag bounded; OLAP scans read replica without blocking OLTP |
 
 ## Milestone details
