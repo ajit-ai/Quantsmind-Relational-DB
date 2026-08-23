@@ -1,13 +1,9 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import App from './App.tsx';
-import { ThemeProvider } from './lib/theme.tsx';
-import './index.css';
+import QmindStudio from './QmindStudio';
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <ThemeProvider>
-      <App />
-    </ThemeProvider>
-  </StrictMode>
+    <QmindStudio />
+  </StrictMode>,
 );
