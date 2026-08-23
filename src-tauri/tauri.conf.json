@@ -3,7 +3,6 @@
   "productName": "QuantsMind Studio",
   "version": "0.1.0",
   "identifier": "com.quantsmind.studio",
-  "withGlobalTauri": true,
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
