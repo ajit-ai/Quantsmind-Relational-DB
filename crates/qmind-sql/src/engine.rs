@@ -72,6 +72,9 @@ impl<W: Write> Engine<W> {
     fn create_table(&mut self, ct: &sqlparser::ast::CreateTable) -> Result<ExecResult, String> {
         let name = object_name(&ct.name)?;
         if self.tables.contains_key(&name) {
+            if ct.if_not_exists {
+                return Ok(ExecResult::empty());
+            }
             return Err(format!("table `{name}` already exists"));
         }
         let mut cols = Vec::new();
