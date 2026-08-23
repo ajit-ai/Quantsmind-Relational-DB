@@ -8,3 +8,4 @@ authors.workspace = true
 
 [dependencies]
 qmind-kernel = { workspace = true }
+sqlparser = "0.50"

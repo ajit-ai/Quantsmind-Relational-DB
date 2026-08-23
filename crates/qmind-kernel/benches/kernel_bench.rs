@@ -50,10 +50,10 @@ fn bench_wal_group_commit(c: &mut Criterion) {
         b.iter(|| {
             let mut w = qmind_kernel::WalWriter::new(Vec::new());
             for i in 0..1000u64 {
-                w.append(&WalRecord::Insert {
+                w.append(&WalRecord::Put {
                     txn: i,
-                    page: i,
-                    slot: 0,
+                    key: format!("key-{i}").into_bytes(),
+                    value: i.to_le_bytes().to_vec(),
                 });
             }
             w.commit_group().unwrap()

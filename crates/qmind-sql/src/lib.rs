@@ -1,11 +1,15 @@
 //! # qmind-sql
 //!
-//! Parser → logical plan → rule rewrites → push-based vectorized executor.
+//! Parser → plan-lite → executor over the MVCC kernel.
 //!
-//! - M3: single-table DDL/DML + scan/filter/insert, columnar batches (~2048 rows)
+//! - M3: single-table DDL/DML + scan/filter/project, columnar batches (~2048 rows)
 //! - M4: joins, aggregates, secondary indexes, OLTP/OLAP plan routing (D-001)
-//!
-//! Parsing will use `sqlparser-rs` in Postgres dialect — never hand-rolled.
+
+pub mod codec;
+pub mod engine;
+
+pub use codec::{ColumnDef, ColumnType, SqlValue};
+pub use engine::{Engine, ExecResult};
 
 /// Rows per execution batch. Tunable; 2048 balances SIMD utilization against
 /// cache footprint. Frozen as a contract for M3 benchmarks.
