@@ -3,7 +3,7 @@ name = "qmind-desktop"
 description = "QuantsMind Desktop Studio (Tauri 2 shell)"
 version = "0.1.0"
 edition = "2021"
-rust-version = "0.1.0"
+rust-version = "1.75"
 authors = ["QuantsMind contributors"]
 
 [build-dependencies]
