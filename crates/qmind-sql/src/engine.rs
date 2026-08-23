@@ -181,6 +181,35 @@ impl<W: Write> Engine<W> {
             .cloned()
             .ok_or_else(|| format!("no table `{table}`"))?;
 
+        // Aggregate fast path: SELECT COUNT(*)|COUNT(c)|SUM|AVG|MIN|MAX(c)
+        // [WHERE cond]. GROUP BY / mixed projections arrive with M4b.
+        if let Some(aggs) = try_parse_aggregates(&body.projection, &schema)? {
+            let (_, snap) = self.db.begin();
+            let mut rows = Vec::new();
+            for rid in 0..*self.next_row_id.get(&table).unwrap_or(&0) {
+                let key = row_key(&table, rid);
+                let Some(raw) = self.db.get_raw(&key, &snap) else {
+                    continue;
+                };
+                let Some(full) = decode_row(&raw, &schema) else {
+                    continue;
+                };
+                match &body.selection {
+                    Some(pred) if !eval_predicate(pred, &schema, &full)? => continue,
+                    _ => rows.push(full),
+                }
+            }
+            let out = aggs
+                .iter()
+                .map(|a| a.evaluate(&rows))
+                .collect::<Result<Vec<_>, String>>()?;
+            return Ok(ExecResult {
+                columns: aggs.into_iter().map(|a| a.label).collect(),
+                rows: vec![out],
+                rows_affected: 0,
+            });
+        }
+
         // Projection plan.
         enum Proj {
             All,
@@ -318,4 +347,134 @@ fn object_name(n: &ObjectName) -> Result<String, String> {
         return Err(format!("qualified names unsupported: {}", parts.join(".")));
     }
     Ok(parts.into_iter().next().expect("non-empty"))
+}
+
+// == M4 aggregates ==========================================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AggFn {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// One aggregate projection; col is a pre-bound schema index
+/// (None = COUNT(*)).
+struct Aggregate {
+    label: String,
+    func: AggFn,
+    col: Option<usize>,
+}
+
+impl Aggregate {
+    fn evaluate(&self, rows: &[Vec<SqlValue>]) -> Result<SqlValue, String> {
+        if self.func == AggFn::Count && self.col.is_none() {
+            return Ok(SqlValue::Int(rows.len() as i64));
+        }
+        let idx = self.col.expect("COUNT(*) handled above");
+        let mut ints: Vec<i64> = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
+        for r in rows {
+            match &r[idx] {
+                SqlValue::Null => continue,
+                SqlValue::Int(v) => ints.push(*v),
+                SqlValue::Text(v) => texts.push(v.clone()),
+            }
+        }
+        Ok(match self.func {
+            AggFn::Count => SqlValue::Int((ints.len() + texts.len()) as i64),
+            AggFn::Sum => {
+                if ints.is_empty() && texts.is_empty() {
+                    SqlValue::Null
+                } else if !ints.is_empty() {
+                    SqlValue::Int(ints.iter().sum())
+                } else {
+                    return Err("SUM requires INTEGER column".into());
+                }
+            }
+            AggFn::Avg => {
+                if ints.is_empty() {
+                    return Ok(SqlValue::Null);
+                }
+                let sum: i64 = ints.iter().sum();
+                SqlValue::Int(sum / ints.len() as i64)
+            }
+            AggFn::Min | AggFn::Max => {
+                let want_min = self.func == AggFn::Min;
+                if ints.is_empty() && texts.is_empty() {
+                    return Ok(SqlValue::Null);
+                }
+                if !ints.is_empty() && !texts.is_empty() {
+                    return Err("mixed types in MIN/MAX".into());
+                }
+                if !ints.is_empty() {
+                    let best = if want_min {
+                        ints.iter().min().expect("non-empty")
+                    } else {
+                        ints.iter().max().expect("non-empty")
+                    };
+                    SqlValue::Int(*best)
+                } else {
+                    let mut best = &texts[0];
+                    for v in &texts[1..] {
+                        if (want_min && v < best) || (!want_min && v > best) {
+                            best = v;
+                        }
+                    }
+                    SqlValue::Text(best.clone())
+                }
+            }
+        })
+    }
+}
+
+fn try_parse_aggregates(
+    projection: &[sqlparser::ast::SelectItem],
+    schema: &[ColumnDef],
+) -> Result<Option<Vec<Aggregate>>, String> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr};
+    let mut out = Vec::with_capacity(projection.len());
+    for item in projection {
+        let sqlparser::ast::SelectItem::UnnamedExpr(e) = item else {
+            return Ok(None);
+        };
+        let Expr::Function(f) = e else {
+            return Ok(None);
+        };
+        let fname = f.name.to_string().to_uppercase();
+        let func = match fname.as_str() {
+            "COUNT" => AggFn::Count,
+            "SUM" => AggFn::Sum,
+            "AVG" => AggFn::Avg,
+            "MIN" => AggFn::Min,
+            "MAX" => AggFn::Max,
+            _ => continue,
+        };
+        let arg0: Option<FunctionArgExpr> = match &f.args {
+            sqlparser::ast::FunctionArguments::None => None,
+            sqlparser::ast::FunctionArguments::Subquery(sq) => {
+                return Err(format!("{fname}(subquery) unsupported"));
+            }
+            sqlparser::ast::FunctionArguments::List(l) => l.args.first().map(|a| match a {
+                FunctionArg::Unnamed(n) => n.clone(),
+                FunctionArg::Named { arg, .. } => arg.clone(),
+            }),
+        };
+        let col = match arg0 {
+            Some(FunctionArgExpr::Wildcard) => None,
+            Some(FunctionArgExpr::Expr(Expr::Identifier(id))) => {
+                let pos = schema
+                    .iter()
+                    .position(|c| c.name == id.value)
+                    .ok_or_else(|| format!("unknown column {}", id.value))?;
+                Some(pos)
+            }
+            _ => return Err(format!("{fname} requires a single argument")),
+        };
+        let label = format!("{fname}({})", if col.is_none() { "*" } else { "c" });
+        out.push(Aggregate { label, func, col });
+    }
+    Ok(Some(out))
 }

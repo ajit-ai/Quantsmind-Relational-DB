@@ -106,3 +106,30 @@ fn errors_are_clean_strings() {
         .unwrap_err()
         .contains("no table"));
 }
+
+#[test]
+fn aggregates_count_sum_avg_min_max_with_filter() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE s (v INTEGER, tag TEXT)").unwrap();
+    for i in 1..=10 {
+        eng.execute(&format!("INSERT INTO s VALUES ({i}, 'g{}')", i % 2))
+            .unwrap();
+    }
+
+    let r = eng.execute("SELECT COUNT(*) FROM s").unwrap();
+    assert_eq!(r.rows[0][0], SqlValue::Int(10));
+
+    let r = eng
+        .execute("SELECT SUM(v), AVG(v), MIN(v), MAX(v) FROM s WHERE v <= 4")
+        .unwrap();
+    assert_eq!(r.rows[0][0], SqlValue::Int(10));
+    assert_eq!(r.rows[0][1], SqlValue::Int(2));
+    assert_eq!(r.rows[0][2], SqlValue::Int(1));
+    assert_eq!(r.rows[0][3], SqlValue::Int(4));
+
+    let r = eng.execute("SELECT MIN(tag) FROM s").unwrap();
+    assert_eq!(r.rows[0][0], SqlValue::Text("g0".into()));
+
+    let r = eng.execute("SELECT COUNT(v) FROM s WHERE v > 100").unwrap();
+    assert_eq!(r.rows[0][0], SqlValue::Int(0));
+}
