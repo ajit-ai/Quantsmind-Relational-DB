@@ -18,6 +18,3 @@ tauri = { version = "2", features = [] }
 name = "qmind-desktop"
 path = "src/main.rs"
 
-[lib]
-name = "qmind_desktop_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
