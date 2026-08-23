@@ -181,8 +181,15 @@ impl<W: Write> Engine<W> {
             .cloned()
             .ok_or_else(|| format!("no table `{table}`"))?;
 
+        // GROUP BY path: aggregates + grouping columns bucketed per key.
+        if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &body.group_by {
+            if !exprs.is_empty() {
+                return self.select_group_by(body, exprs, &schema, &table);
+            }
+        }
+
         // Aggregate fast path: SELECT COUNT(*)|COUNT(c)|SUM|AVG|MIN|MAX(c)
-        // [WHERE cond]. GROUP BY / mixed projections arrive with M4b.
+        // [WHERE cond].
         if let Some(aggs) = try_parse_aggregates(&body.projection, &schema)? {
             let (_, snap) = self.db.begin();
             let mut rows = Vec::new();
@@ -263,6 +270,140 @@ impl<W: Write> Engine<W> {
                 Proj::All => full,
                 Proj::Cols(idx) => idx.iter().map(|&i| full[i].clone()).collect(),
             });
+        }
+
+        Ok(ExecResult {
+            columns: out_cols,
+            rows,
+            rows_affected: 0,
+        })
+    }
+
+    /// GROUP BY execution: bucket filtered rows by grouping-key tuple, then
+    /// evaluate each aggregate per bucket. Output is ordered by group key
+    /// (BTreeMap) — deterministic without an explicit ORDER BY.
+    fn select_group_by(
+        &mut self,
+        body: &sqlparser::ast::Select,
+        exprs: &[Expr],
+        schema: &[ColumnDef],
+        table: &str,
+    ) -> Result<ExecResult, String> {
+        use sqlparser::ast::{FunctionArg, FunctionArgExpr};
+
+        let mut key_idx = Vec::with_capacity(exprs.len());
+        for e in exprs {
+            let Expr::Identifier(id) = e else {
+                return Err("GROUP BY supports plain columns only".into());
+            };
+            let pos = schema
+                .iter()
+                .position(|c| c.name == id.value)
+                .ok_or_else(|| format!("unknown column {}", id.value))?;
+            key_idx.push(pos);
+        }
+
+        enum Item {
+            Key(usize),
+            Agg(Aggregate),
+        }
+        let mut items = Vec::new();
+        let mut out_cols = Vec::new();
+        for item in &body.projection {
+            let sqlparser::ast::SelectItem::UnnamedExpr(e) = item else {
+                return Err("GROUP BY projection must be plain expressions".into());
+            };
+            match e {
+                Expr::Function(f) => {
+                    let fname = f.name.to_string().to_uppercase();
+                    let func = match fname.as_str() {
+                        "COUNT" => AggFn::Count,
+                        "SUM" => AggFn::Sum,
+                        "AVG" => AggFn::Avg,
+                        "MIN" => AggFn::Min,
+                        "MAX" => AggFn::Max,
+                        other => return Err(format!("unsupported function {other}")),
+                    };
+                    let arg0: Option<FunctionArgExpr> = match &f.args {
+                        sqlparser::ast::FunctionArguments::None => None,
+                        sqlparser::ast::FunctionArguments::List(l) => {
+                            l.args.first().map(|a| match a {
+                                FunctionArg::Unnamed(n) => n.clone(),
+                                FunctionArg::Named { arg, .. } => arg.clone(),
+                            })
+                        }
+                        sqlparser::ast::FunctionArguments::Subquery(_) => {
+                            return Err(format!("{fname}(subquery) unsupported"));
+                        }
+                    };
+                    let col = match arg0 {
+                        Some(FunctionArgExpr::Wildcard) => None,
+                        Some(FunctionArgExpr::Expr(Expr::Identifier(id))) => Some(
+                            schema
+                                .iter()
+                                .position(|c| c.name == id.value)
+                                .ok_or_else(|| format!("unknown column {}", id.value))?,
+                        ),
+                        _ => return Err(format!("{fname} requires a single argument")),
+                    };
+                    out_cols.push(format!(
+                        "{fname}({})",
+                        if col.is_none() { "*" } else { "c" }
+                    ));
+                    items.push(Item::Agg(Aggregate {
+                        label: String::new(),
+                        func,
+                        col,
+                    }));
+                }
+                Expr::Identifier(id) => {
+                    let pos = schema
+                        .iter()
+                        .position(|c| c.name == id.value)
+                        .ok_or_else(|| format!("unknown column {}", id.value))?;
+                    if !key_idx.contains(&pos) {
+                        return Err(format!(
+                            "column {} must appear in GROUP BY or be aggregated",
+                            id.value
+                        ));
+                    }
+                    out_cols.push(id.value.clone());
+                    items.push(Item::Key(pos));
+                }
+                other => return Err(format!("unsupported GROUP BY projection {other:?}")),
+            }
+        }
+
+        let (_, snap) = self.db.begin();
+        let mut buckets: std::collections::BTreeMap<Vec<SqlValue>, Vec<Vec<SqlValue>>> =
+            std::collections::BTreeMap::new();
+        for rid in 0..*self.next_row_id.get(table).unwrap_or(&0) {
+            let key = row_key(table, rid);
+            let Some(raw) = self.db.get_raw(&key, &snap) else {
+                continue;
+            };
+            let Some(full) = decode_row(&raw, schema) else {
+                continue;
+            };
+            if let Some(pred) = &body.selection {
+                if !eval_predicate(pred, schema, &full)? {
+                    continue;
+                }
+            }
+            let gkey: Vec<SqlValue> = key_idx.iter().map(|&i| full[i].clone()).collect();
+            buckets.entry(gkey).or_default().push(full);
+        }
+
+        let mut rows = Vec::with_capacity(buckets.len());
+        for (_gk, bucket) in buckets {
+            let mut out = Vec::with_capacity(items.len());
+            for item in &items {
+                match item {
+                    Item::Key(i) => out.push(bucket[0][*i].clone()),
+                    Item::Agg(a) => out.push(a.evaluate(&bucket)?),
+                }
+            }
+            rows.push(out);
         }
 
         Ok(ExecResult {
