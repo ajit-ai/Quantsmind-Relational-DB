@@ -8,7 +8,9 @@
 
 use crate::codec::{decode_row, encode_row, row_key, ColumnDef, ColumnType, SqlValue};
 use qmind_kernel::{MvccStore, WalWriter};
-use sqlparser::ast::{BinaryOperator, Expr, ObjectName, Statement, Value as SqlParserValue};
+use sqlparser::ast::{
+    BinaryOperator, Expr, JoinConstraint, ObjectName, Statement, Value as SqlParserValue,
+};
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
 use std::io::Write;
@@ -168,6 +170,12 @@ impl<W: Write> Engine<W> {
             sqlparser::ast::SetExpr::Select(sel) => sel,
             _ => return Err("only simple SELECT supported".into()),
         };
+
+        // M4c: two-table INNER JOIN ... ON equi-condition → hash join.
+        if !body.from.is_empty() && !body.from[0].joins.is_empty() {
+            return self.select_join(body, &q.limit);
+        }
+
         let table = match body.from.first() {
             Some(f) => match &f.relation {
                 sqlparser::ast::TableFactor::Table { name, .. } => object_name(name)?,
@@ -279,6 +287,172 @@ impl<W: Write> Engine<W> {
         })
     }
 
+    /// M4c: hash join for left INNER JOIN right ON lcol = rcol.
+    /// Builds a hash table over the right side, probes with left rows,
+    /// then applies WHERE / projection / LIMIT on the concatenated rows.
+    fn select_join(
+        &mut self,
+        body: &sqlparser::ast::Select,
+        limit: &Option<Expr>,
+    ) -> Result<ExecResult, String> {
+        let left_rel = &body.from[0].relation;
+        let (lt, rt) = match (&left_rel, body.from[0].joins.first().map(|j| &j.relation)) {
+            (
+                sqlparser::ast::TableFactor::Table { name: ln, .. },
+                Some(sqlparser::ast::TableFactor::Table { name: rn, .. }),
+            ) => (object_name(ln)?, object_name(rn)?),
+            _ => return Err("JOIN supports plain tables only".into()),
+        };
+        if lt == rt {
+            return Err("self-joins unsupported".into());
+        }
+        let lschema = self
+            .tables
+            .get(&lt)
+            .cloned()
+            .ok_or_else(|| format!("no table `{lt}`"))?;
+        let rschema = self
+            .tables
+            .get(&rt)
+            .cloned()
+            .ok_or_else(|| format!("no table `{rt}`"))?;
+
+        // Join predicate must be exactly col = col.
+        let on = match &body.from[0].joins[0].join_operator {
+            sqlparser::ast::JoinOperator::Inner(JoinConstraint::On(e)) => Ok(e.clone()),
+            sqlparser::ast::JoinOperator::Inner(other) => {
+                Err(format!("unsupported JOIN constraint {other:?}"))
+            }
+            other => Err(format!("only INNER JOIN supported, got {other:?}")),
+        }?;
+        let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } = on
+        else {
+            return Err("JOIN ON must be an equality".into());
+        };
+
+        let combined: Vec<ColumnDef> = lschema.iter().chain(rschema.iter()).cloned().collect();
+        let find_col = |name: &str| -> Option<(bool, usize)> {
+            let mut hit = None;
+            if let Some(p) = lschema.iter().position(|c| c.name == name) {
+                hit = Some((true, p));
+            }
+            if let Some(p) = rschema.iter().position(|c| c.name == name) {
+                if hit.is_some() {
+                    return None; // ambiguous
+                }
+                hit = Some((false, p));
+            }
+            hit
+        };
+        let resolve_side = |e: &Expr| -> Result<(bool, usize), String> {
+            let Expr::Identifier(id) = e else {
+                return Err("JOIN ON sides must be columns".into());
+            };
+            find_col(&id.value).ok_or_else(|| format!("unknown column {}", id.value))
+        };
+        let (lside, rside) = {
+            let a = resolve_side(&left)?;
+            let b = resolve_side(&right)?;
+            match (a.0, b.0) {
+                (true, false) => ((a.1 as u8, 0u8), (b.1 as u8, 1u8)),
+                (false, true) => ((b.1 as u8, 0u8), (a.1 as u8, 1u8)),
+                _ => return Err("JOIN ON must span both tables".into()),
+            }
+        };
+        let (li, ri) = (lside.0 as usize, rside.0 as usize);
+
+        // Build phase: hash right rows by join key.
+        let (_, snap) = self.db.begin();
+        let mut hash: std::collections::HashMap<SqlValue, Vec<Vec<SqlValue>>> =
+            std::collections::HashMap::new();
+        for rid in 0..*self.next_row_id.get(&rt).unwrap_or(&0) {
+            let key = row_key(&rt, rid);
+            let Some(raw) = self.db.get_raw(&key, &snap) else {
+                continue;
+            };
+            let Some(row) = decode_row(&raw, &rschema) else {
+                continue;
+            };
+            if row[ri] == SqlValue::Null {
+                continue;
+            }
+            hash.entry(row[ri].clone()).or_default().push(row);
+        }
+
+        // Probe phase.
+        let mut joined: Vec<Vec<SqlValue>> = Vec::new();
+        for rid in 0..*self.next_row_id.get(&lt).unwrap_or(&0) {
+            let key = row_key(&lt, rid);
+            let Some(raw) = self.db.get_raw(&key, &snap) else {
+                continue;
+            };
+            let Some(lrow) = decode_row(&raw, &lschema) else {
+                continue;
+            };
+            if lrow[li] == SqlValue::Null {
+                continue;
+            }
+            if let Some(matches) = hash.get(&lrow[li]) {
+                for rrow in matches {
+                    joined.push(lrow.iter().chain(rrow.iter()).cloned().collect());
+                }
+            }
+        }
+
+        // WHERE on combined row.
+        if let Some(pred) = &body.selection {
+            joined.retain(|r| eval_predicate(pred, &combined, r).unwrap_or(false));
+        }
+
+        // Projection.
+        enum Proj2 {
+            All,
+            Cols(Vec<usize>),
+        }
+        let (proj, out_cols) = if body.projection.len() == 1
+            && matches!(body.projection[0], sqlparser::ast::SelectItem::Wildcard(_))
+        {
+            (
+                Proj2::All,
+                combined.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+            )
+        } else {
+            let mut idx = Vec::new();
+            let mut names = Vec::new();
+            for item in &body.projection {
+                let sqlparser::ast::SelectItem::UnnamedExpr(Expr::Identifier(id)) = item else {
+                    return Err("only plain column projections supported on joins".into());
+                };
+                let (is_l, p) =
+                    find_col(&id.value).ok_or_else(|| format!("unknown column {}", id.value))?;
+                idx.push(if is_l { p } else { lschema.len() + p });
+                names.push(id.value.clone());
+            }
+            (Proj2::Cols(idx), names)
+        };
+
+        let max_rows = limit_literal(limit)?;
+        let mut out_rows = Vec::new();
+        for full in joined {
+            if max_rows > 0 && out_rows.len() >= max_rows {
+                break;
+            }
+            out_rows.push(match &proj {
+                Proj2::All => full,
+                Proj2::Cols(idx) => idx.iter().map(|&i| full[i].clone()).collect(),
+            });
+        }
+
+        Ok(ExecResult {
+            columns: out_cols,
+            rows: out_rows,
+            rows_affected: 0,
+        })
+    }
     /// GROUP BY execution: bucket filtered rows by grouping-key tuple, then
     /// evaluate each aggregate per bucket. Output is ordered by group key
     /// (BTreeMap) — deterministic without an explicit ORDER BY.

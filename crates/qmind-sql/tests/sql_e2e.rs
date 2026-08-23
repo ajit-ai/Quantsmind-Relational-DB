@@ -166,3 +166,38 @@ fn group_by_with_filter_and_multiple_aggs() {
     // non-grouped bare column rejected
     assert!(eng.execute("SELECT v FROM s GROUP BY tag").is_err());
 }
+
+#[test]
+fn inner_join_hash_matches_and_filters() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE customers (id INTEGER, name TEXT)")
+        .unwrap();
+    eng.execute("CREATE TABLE orders (cid INTEGER, amount INTEGER)")
+        .unwrap();
+    eng.execute("INSERT INTO customers VALUES (1, 'Ada'), (2, 'Grace'), (3, 'Lonely')")
+        .unwrap();
+    eng.execute("INSERT INTO orders VALUES (1, 100), (1, 250), (2, 75), (9, 999)")
+        .unwrap();
+
+    let r = eng
+        .execute("SELECT name, amount FROM customers INNER JOIN orders ON id = cid")
+        .unwrap();
+    assert_eq!(r.columns, vec!["name", "amount"]);
+    assert_eq!(r.rows.len(), 3); // customer 3 and order cid=9 have no match
+    let total: i64 = r
+        .rows
+        .iter()
+        .map(|row| match &row[1] {
+            SqlValue::Int(v) => *v,
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(total, 425);
+
+    let r = eng
+        .execute("SELECT name FROM customers INNER JOIN orders ON id = cid WHERE amount > 200")
+        .unwrap();
+    assert_eq!(r.rows, vec![vec![SqlValue::Text("Ada".into())]]);
+
+    // TODO(M4d): qualified names (t.col) + ambiguity detection
+}
