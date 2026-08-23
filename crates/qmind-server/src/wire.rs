@@ -40,7 +40,7 @@ fn handle_conn<W: Write>(mut s: TcpStream, eng: Arc<Mutex<Engine<W>>>) -> std::i
         return Ok(());
     }
     let len = i32::from_be_bytes(lb) as usize;
-    if len < 8 || len > 10_000 {
+    if !(8..=10_000).contains(&len) {
         return Ok(());
     }
     let mut buf = vec![0u8; len - 4];
@@ -163,7 +163,7 @@ fn param(s: &mut TcpStream, k: &str, v: &str) -> std::io::Result<()> {
 }
 
 fn ready(s: &mut TcpStream) -> std::io::Result<()> {
-    write_msg(s, b'Z', &[b'I'])
+    write_msg(s, b'Z', b"I")
 }
 
 fn empty_query_response(s: &mut TcpStream) -> std::io::Result<()> {
