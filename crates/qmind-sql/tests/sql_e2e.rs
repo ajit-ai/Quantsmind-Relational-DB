@@ -133,3 +133,36 @@ fn aggregates_count_sum_avg_min_max_with_filter() {
     let r = eng.execute("SELECT COUNT(v) FROM s WHERE v > 100").unwrap();
     assert_eq!(r.rows[0][0], SqlValue::Int(0));
 }
+
+#[test]
+fn group_by_with_filter_and_multiple_aggs() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE s (v INTEGER, tag TEXT)").unwrap();
+    for i in 1..=8 {
+        eng.execute(&format!("INSERT INTO s VALUES ({i}, 'g{}')", i % 2))
+            .unwrap();
+    }
+
+    let r = eng
+        .execute("SELECT tag, COUNT(*), SUM(v) FROM s GROUP BY tag")
+        .unwrap();
+    assert_eq!(r.columns.len(), 3);
+    // BTreeMap order: g0 first, then g1
+    assert_eq!(r.rows[0][0], SqlValue::Text("g0".into()));
+    assert_eq!(r.rows[0][1], SqlValue::Int(4)); // v in {2,4,6,8}
+    assert_eq!(r.rows[0][2], SqlValue::Int(20));
+    assert_eq!(r.rows[1][0], SqlValue::Text("g1".into()));
+    assert_eq!(r.rows[1][1], SqlValue::Int(4)); // v in {1,3,5,7}
+    assert_eq!(r.rows[1][2], SqlValue::Int(16));
+
+    let r = eng
+        .execute("SELECT tag, MIN(v), MAX(v) FROM s WHERE v <= 4 GROUP BY tag")
+        .unwrap();
+    assert_eq!(r.rows[0][1], SqlValue::Int(2));
+    assert_eq!(r.rows[0][2], SqlValue::Int(4));
+    assert_eq!(r.rows[1][1], SqlValue::Int(1));
+    assert_eq!(r.rows[1][2], SqlValue::Int(3));
+
+    // non-grouped bare column rejected
+    assert!(eng.execute("SELECT v FROM s GROUP BY tag").is_err());
+}
