@@ -341,6 +341,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "qmind-embed"
+version = "0.1.0"
+dependencies = [
+ "qmind-sql",
+ "serde_json",
+]
+
+[[package]]
 name = "qmind-kernel"
 version = "0.1.0"
 dependencies = [
