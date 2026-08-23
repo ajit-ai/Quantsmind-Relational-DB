@@ -10,7 +10,7 @@ authors = ["QuantsMind contributors"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-qmind-embed = { path = "../qmind-embed" }
+qmind-embed = { path = "../crates/qmind-embed" }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 
