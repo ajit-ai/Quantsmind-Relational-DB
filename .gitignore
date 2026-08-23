@@ -25,3 +25,6 @@ dist-ssr
 # Rust
 /target
 **/*.rs.bk
+
+# Tauri/Rust build artifacts (desktop shell)
+src-tauri/target
