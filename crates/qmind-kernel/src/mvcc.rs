@@ -128,6 +128,11 @@ impl MvccStore {
                 return Some(v.clone());
             }
         }
+        self.get_raw(key, snap)
+    }
+
+    /// Committed-value read without a transaction context.
+    pub fn get_raw(&self, key: &[u8], snap: &Snapshot) -> Option<Vec<u8>> {
         self.data
             .get(key)?
             .iter()

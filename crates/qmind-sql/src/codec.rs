@@ -3,6 +3,7 @@
 //! - Int(i64): tag 0 + 8 LE bytes
 //! - Text:     tag 1 + u32 len + UTF-8
 //! - Null:     tag 2
+//!
 //! Row keys: `{table}\u{1}{row_id:020}` — lexicographic order == insertion
 //! order within a table.
 
@@ -39,7 +40,7 @@ impl ColumnType {
         }
     }
 
-    fn check(self, v: &SqlValue) -> bool {
+    pub fn check(self, v: &SqlValue) -> bool {
         matches!(
             (self, v),
             (ColumnType::Int, SqlValue::Int(_))
@@ -91,8 +92,8 @@ pub fn decode_row(bytes: &[u8], schema: &[ColumnDef]) -> Option<Vec<SqlValue>> {
                 pos += 9;
             }
             1 => {
-                let len = u32::from_le_bytes(bytes.get(pos + 1..pos + 5)?.try_into().unwrap())
-                    as usize;
+                let len =
+                    u32::from_le_bytes(bytes.get(pos + 1..pos + 5)?.try_into().unwrap()) as usize;
                 let s = bytes.get(pos + 5..pos + 5 + len)?;
                 out.push(SqlValue::Text(String::from_utf8_lossy(s).into_owned()));
                 pos += 5 + len;
@@ -117,8 +118,16 @@ mod tests {
 
     fn schema() -> Vec<ColumnDef> {
         vec![
-            ColumnDef { name: "id".into(), ty: ColumnType::Int, nullable: false },
-            ColumnDef { name: "name".into(), ty: ColumnType::Text, nullable: true },
+            ColumnDef {
+                name: "id".into(),
+                ty: ColumnType::Int,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "name".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+            },
         ]
     }
 

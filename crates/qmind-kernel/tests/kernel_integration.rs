@@ -7,7 +7,6 @@ use std::io::Cursor;
 type CommittedRow = (Vec<u8>, Vec<u8>);
 type OpenTxnWrites = std::collections::HashMap<u64, Vec<CommittedRow>>;
 
-
 #[test]
 fn flushed_store_survives_pool_replacement() {
     let mut pool = BufferPool::in_memory(2);
