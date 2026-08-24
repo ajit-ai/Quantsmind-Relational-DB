@@ -150,7 +150,6 @@ pub struct HashJoin {
     hash: HashMap<SqlValue, Vec<Row>>,
     pending: Vec<Row>,
     lkey: usize,
-    rkey: usize,
     built: bool,
     lcols: usize,
 }
@@ -160,7 +159,7 @@ impl HashJoin {
         left: Box<dyn Operator>,
         mut right: Box<dyn Operator>,
         lkey: usize,
-        rkey: usize,
+            rkey: usize,
         lcols: usize,
     ) -> Result<Self, String> {
         let mut hash: HashMap<SqlValue, Vec<Row>> = HashMap::new();
@@ -175,7 +174,6 @@ impl HashJoin {
             hash,
             pending: Vec::new(),
             lkey,
-            rkey,
             built: true,
             lcols,
         })
