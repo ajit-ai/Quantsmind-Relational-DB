@@ -159,7 +159,7 @@ impl HashJoin {
         left: Box<dyn Operator>,
         mut right: Box<dyn Operator>,
         lkey: usize,
-            rkey: usize,
+        rkey: usize,
         lcols: usize,
     ) -> Result<Self, String> {
         let mut hash: HashMap<SqlValue, Vec<Row>> = HashMap::new();
