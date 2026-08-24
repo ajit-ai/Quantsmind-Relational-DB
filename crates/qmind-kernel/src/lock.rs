@@ -18,11 +18,6 @@ pub enum LockMode {
     Exclusive,
 }
 
-impl LockMode {
-    fn compatible(a: LockMode, b: LockMode) -> bool {
-        matches!((a, b), (LockMode::Shared, LockMode::Shared))
-    }
-}
 
 #[derive(Debug)]
 pub enum LockError {
@@ -156,10 +151,7 @@ impl LockManager {
         }
         // promote from queue while head is grantable; the waiter's own
         // current hold (e.g. S in an S→X upgrade) must not block itself
-        loop {
-            let Some(&(wt, wm)) = entry.queue.front() else {
-                break;
-            };
+        while let Some(&(wt, wm)) = entry.queue.front() {
             let remaining = entry
                 .holders
                 .iter()
