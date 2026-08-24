@@ -7,6 +7,8 @@
 //!   predicates: col op literal chained with AND; ops = != < <= > >=
 
 use crate::codec::{decode_row, encode_row, row_key, ColumnDef, ColumnType, SqlValue};
+use crate::executor::Row;
+use crate::executor::{Filter, Limit, Operator, Project, VecScan};
 use qmind_kernel::{MvccStore, WalWriter};
 use sqlparser::ast::{
     BinaryOperator, Expr, JoinConstraint, ObjectName, Statement, Value as SqlParserValue,
@@ -266,30 +268,39 @@ impl<W: Write> Engine<W> {
             (Proj::Cols(idx), names)
         };
 
-        // Scan → filter under a single MVCC snapshot.
+        // E4b: materialize the MVCC scan, then run the Volcano pipeline
+        // VecScan → Filter → Project → Limit. (Storage-side streaming Scan
+        // replaces this pre-step when the snapshot iterator lands.)
         let (_, snap) = self.db.begin();
         let max_rows = limit_literal(&q.limit)?;
-        let mut rows = Vec::new();
-        'scan: for rid in 0..*self.next_row_id.get(&table).unwrap_or(&0) {
-            if max_rows > 0 && rows.len() >= max_rows {
-                break 'scan;
-            }
+        let mut raw_rows: Vec<Row> = Vec::new();
+        for rid in 0..*self.next_row_id.get(&table).unwrap_or(&0) {
             let key = row_key(&table, rid);
             let Some(raw) = self.db.get_raw(&key, &snap) else {
                 continue;
             };
-            let Some(full) = decode_row(&raw, &schema) else {
-                continue;
-            };
-            if let Some(pred) = &body.selection {
-                if !eval_predicate(pred, &schema, &full)? {
-                    continue;
-                }
+            if let Some(full) = decode_row(&raw, &schema) {
+                raw_rows.push(full);
             }
-            rows.push(match &proj {
-                Proj::All => full,
-                Proj::Cols(idx) => idx.iter().map(|&i| full[i].clone()).collect(),
-            });
+        }
+
+        let mut op: Box<dyn Operator> = Box::new(VecScan::new(raw_rows));
+        if let Some(pred) = &body.selection {
+            let s = schema.clone();
+            let p: Expr = pred.clone();
+            op = Box::new(Filter::new(op, move |r: &Row| eval_predicate(&p, &s, r)));
+        }
+        op = match &proj {
+            Proj::All => op,
+            Proj::Cols(idx) => Box::new(Project::new(op, idx.clone())),
+        };
+        if max_rows > 0 {
+            op = Box::new(Limit::new(op, max_rows));
+        }
+
+        let mut rows = Vec::new();
+        while let Some(r) = op.next()? {
+            rows.push(r);
         }
 
         Ok(ExecResult {
