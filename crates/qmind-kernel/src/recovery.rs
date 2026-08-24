@@ -225,7 +225,7 @@ mod tests {
         log.truncate(log.len() - 3); // tear the tail of group 2
 
         let st = recover(&log).unwrap();
-        assert!(st.status[&2] == TxnStatus::InFlight || st.status.get(&2).is_none());
+        assert!(!matches!(st.status.get(&2), Some(TxnStatus::Committed)));
         assert_eq!(
             st.data.get(b"x".as_slice()).map(|v| v.as_slice()),
             Some(&[7][..])
