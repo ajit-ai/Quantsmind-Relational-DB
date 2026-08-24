@@ -18,7 +18,6 @@ pub enum LockMode {
     Exclusive,
 }
 
-
 #[derive(Debug)]
 pub enum LockError {
     Deadlock { cycle: Vec<u64> },

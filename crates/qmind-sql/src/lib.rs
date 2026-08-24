@@ -7,6 +7,7 @@
 
 pub mod codec;
 pub mod engine;
+pub mod executor;
 
 pub use codec::{ColumnDef, ColumnType, SqlValue};
 pub use engine::{Engine, ExecResult};
