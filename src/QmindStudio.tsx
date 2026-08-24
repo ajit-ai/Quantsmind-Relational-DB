@@ -8,10 +8,12 @@ export default function QmindStudio() {
     "CREATE TABLE IF NOT EXISTS demo (id INTEGER NOT NULL, name TEXT);\nSELECT * FROM demo;"
   );
   const [out, setOut] = useState<string>('Engine ready — press Run.');
+  const [inShell] = useState(() => typeof window !== 'undefined' && !!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
   const [grid, setGrid] = useState<{ cols: string[]; rows: Row[] } | null>(null);
   const [busy, setBusy] = useState(false);
 
   async function onRun() {
+    if (!inShell) return;
     setBusy(true);
     setGrid(null);
     let last = '';
@@ -57,7 +59,9 @@ export default function QmindStudio() {
         style={{ height: 180, resize: 'vertical', background: '#0f152b', color: '#d7dcEA', border: '1px solid #1d2742', margin: 12, borderRadius: 10, padding: 12, fontFamily: 'Consolas, monospace', fontSize: 13 }}
       />
 
-      <div style={{ color: '#8b93a7', padding: '0 16px 4px', fontSize: 12 }}>{out}</div>
+      <div style={{ color: '#8b93a7', padding: '0 16px 4px', fontSize: 12 }}>
+        {inShell ? out : 'Browser preview — launch the desktop app (`npx tauri dev`) to execute SQL against the QuantsMind engine.'}
+      </div>
 
       <div style={{ flex: 1, overflow: 'auto', margin: 12, border: '1px solid #1d2742', borderRadius: 10 }}>
         {grid ? (
