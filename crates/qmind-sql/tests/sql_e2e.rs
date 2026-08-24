@@ -201,3 +201,19 @@ fn inner_join_hash_matches_and_filters() {
 
     // TODO(M4d): qualified names (t.col) + ambiguity detection
 }
+
+#[test]
+fn show_tables_lists_created_tables() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE beta (x INTEGER)").unwrap();
+    eng.execute("CREATE TABLE alpha (y TEXT)").unwrap();
+    let r = eng.execute("SHOW TABLES").unwrap();
+    assert_eq!(r.columns, vec!["table"]);
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Text("alpha".into())],
+            vec![SqlValue::Text("beta".into())]
+        ]
+    );
+}
