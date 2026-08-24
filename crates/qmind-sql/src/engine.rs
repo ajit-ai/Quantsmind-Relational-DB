@@ -53,6 +53,15 @@ impl<W: Write> Engine<W> {
 
     /// Parse + execute a single statement.
     pub fn execute(&mut self, sql: &str) -> Result<ExecResult, String> {
+        if sql.trim().to_uppercase().starts_with("SHOW TABLES") {
+            let mut names: Vec<String> = self.tables.keys().cloned().collect();
+            names.sort();
+            return Ok(ExecResult {
+                columns: vec!["table".into()],
+                rows: names.into_iter().map(|n| vec![SqlValue::Text(n)]).collect(),
+                rows_affected: 0,
+            });
+        }
         let stmts = Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, sql)
             .map_err(|e| format!("syntax error: {e}"))?;
         if stmts.len() != 1 {
