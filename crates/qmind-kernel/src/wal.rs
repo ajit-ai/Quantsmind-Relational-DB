@@ -35,6 +35,10 @@ pub enum WalRecord {
         key: Vec<u8>,
         value: Vec<u8>,
     },
+    /// Fuzzy checkpoint: transactions in flight when it was taken.
+    Checkpoint {
+        active: Vec<TxnId>,
+    },
 }
 
 impl WalRecord {
@@ -51,6 +55,13 @@ impl WalRecord {
             WalRecord::Abort { txn } => {
                 out.push(2);
                 out.extend_from_slice(&txn.to_le_bytes());
+            }
+            WalRecord::Checkpoint { active } => {
+                out.push(4);
+                out.extend_from_slice(&(active.len() as u32).to_le_bytes());
+                for t in active {
+                    out.extend_from_slice(&t.to_le_bytes());
+                }
             }
             WalRecord::Put { txn, key, value } => {
                 out.push(3);
@@ -113,6 +124,27 @@ impl WalRecord {
                     value: buf[vpos + 4..].to_vec(),
                 })
             }
+            4 => {
+                // payload: [tag u8][n u32][txn u64 × n]
+                if buf.len() < 5 {
+                    return Err(Error::WalCorrupt {
+                        at: 0,
+                        reason: "Checkpoint too short".into(),
+                    });
+                }
+                let n = u32::from_le_bytes(buf[1..5].try_into().unwrap()) as usize;
+                if buf.len() != 5 + n * 8 {
+                    return Err(Error::WalCorrupt {
+                        at: 0,
+                        reason: "Checkpoint len mismatch".into(),
+                    });
+                }
+                Ok(WalRecord::Checkpoint {
+                    active: (0..n)
+                        .map(|i| u64::from_le_bytes(buf[5 + i * 8..13 + i * 8].try_into().unwrap()))
+                        .collect(),
+                })
+            }
             other => Err(Error::WalCorrupt {
                 at: 0,
                 reason: format!("unknown tag {other}"),
@@ -146,6 +178,7 @@ impl fmt::Display for WalRecord {
             WalRecord::Put { txn, key, value } => {
                 write!(f, "put t{txn} k{key:?}={}b", value.len())
             }
+            WalRecord::Checkpoint { active } => write!(f, "ckpt active={}", active.len()),
         }
     }
 }

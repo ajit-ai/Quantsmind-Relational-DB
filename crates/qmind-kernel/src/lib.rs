@@ -16,6 +16,7 @@ pub mod error;
 pub mod eviction;
 pub mod mvcc;
 pub mod page;
+pub mod recovery;
 pub mod wal;
 
 pub use btree::BTree;
