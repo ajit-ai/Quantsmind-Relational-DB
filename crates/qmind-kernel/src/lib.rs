@@ -13,6 +13,7 @@
 pub mod btree;
 pub mod buffer;
 pub mod error;
+pub mod eviction;
 pub mod mvcc;
 pub mod page;
 pub mod wal;
