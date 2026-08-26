@@ -420,48 +420,92 @@ The `qmind-embed` crate provides a JSON API wrapper for integration with any lan
 
 ### Pre-built Binaries
 
-CI produces platform binaries on every push to `main`:
+Download from [GitHub Releases](https://github.com/ajit-ai/Quantsmind-Relational-DB/releases):
 
-| Platform | Artifact |
-|---|---|
-| Windows x64 | `qmind-server.exe`, `qmind-cli.exe` |
-| Linux x64 | `qmind-server`, `qmind-cli` |
-| macOS x64 | `qmind-server`, `qmind-cli` |
-| macOS ARM64 (Apple Silicon) | `qmind-server`, `qmind-cli` |
+| Platform | Artifact | Installer |
+|---|---|---|
+| Windows x64 | `qmind-windows-x64-{ver}.zip` | `.msi`, `.exe` NSIS |
+| Linux x64 | `qmind-linux-x64-{ver}.tar.gz` | `.deb`, `.AppImage` |
+| Linux x64 static | `qmind-linux-x64-static-{ver}.tar.gz` | — (no glibc) |
+| Linux ARM64 | `qmind-linux-arm64-{ver}.tar.gz` | — |
+| macOS x64 | `qmind-macos-x64-{ver}.tar.gz` | `.dmg`, `.app` |
+| macOS ARM64 | `qmind-macos-arm64-{ver}.tar.gz` | `.dmg`, `.app` |
+| FreeBSD x64 | `qmind-freebsd-x64-{ver}.tar.gz` | — |
+
+All releases include `SHA256SUMS.txt` for integrity verification.
+
+### One-Line Install Scripts
+
+```bash
+# Linux (Debian/Ubuntu/Fedora/Arch/Alpine)
+curl -sSL https://raw.githubusercontent.com/ajit-ai/Quantsmind-Relational-DB/main/packaging/linux/install.sh | bash
+
+# macOS
+curl -sSL https://raw.githubusercontent.com/ajit-ai/Quantsmind-Relational-DB/main/packaging/macos/install.sh | bash
+
+# FreeBSD
+fetch -qO- https://raw.githubusercontent.com/ajit-ai/Quantsmind-Relational-DB/main/packaging/linux/freebsd-install.sh | bash
+```
+
+### Windows (PowerShell)
+
+```powershell
+# Download and run
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/ajit-ai/Quantsmind-Relational-DB/main/packaging/windows/install.ps1" -OutFile install.ps1
+.\install.ps1
+
+# Or with scoop
+scoop bucket add quantsmind https://github.com/ajit-ai/Quantsmind-Relational-DB
+scoop install qmind
+```
 
 ### Desktop Installers
 
 Built via `npx tauri build` on each platform:
 
-| Platform | Installer |
+| Platform | Format |
 |---|---|
-| Windows | `.msi` and `.exe` NSIS installer |
-| Linux | `.deb` (Debian/Ubuntu), `.AppImage` |
-| macOS | `.dmg` and `.app` bundle |
+| Windows | `.msi` (WiX) and `.exe` (NSIS) installer |
+| Linux | `.deb` (Debian/Ubuntu) and `.AppImage` (universal) |
+| macOS | `.dmg` and `.app` bundle (notarized) |
+
+### Uninstall
+
+```bash
+# Linux
+packaging/linux/uninstall.sh
+
+# macOS
+packaging/macos/uninstall.sh
+
+# Windows (PowerShell, as Admin)
+.\packaging\windows\uninstall.ps1
+```
 
 ### Cross-Compilation
 
 ```bash
-# From Linux, build for Windows
-rustup target add x86_64-pc-windows-gnu
-cargo build --release --target x86_64-pc-windows-gnu
+# From Linux, build for all targets
+./scripts/build-all.sh v0.1.0
 
-# From Linux, build for macOS (requires osxcross)
-rustup target add x86_64-apple-darwin
-cargo build --release --target x86_64-apple-darwin
-
-# From Linux, build for ARM64 Linux
-rustup target add aarch64-unknown-linux-gnu
-cargo build --release --target aarch64-unknown-linux-gnu
+# From Windows, build all targets
+.\scripts\build-all.ps1 -Tag v0.1.0
 ```
 
 ### Static Build (musl)
 
 ```bash
-# Linux static binary (no glibc dependency)
+# Linux static binary (no glibc dependency — runs anywhere)
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
+
+### Automated Release CI
+
+Pushing a tag `v*` triggers `.github/workflows/release.yml`:
+- Builds 6 binary targets + 3 desktop platforms
+- Generates `SHA256SUMS.txt` for all artifacts
+- Creates draft GitHub Release with auto-generated notes
 
 ---
 
@@ -489,12 +533,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 | Suite | Count | Scope |
 |---|---|---|
-| Kernel unit | 33+ | Buffer pool, B+Tree, WAL, MVCC, locks, recovery, eviction, file store |
+| Kernel unit | 41 | Buffer pool, B+Tree, WAL, MVCC, locks, recovery, eviction, file store |
 | SQL engine | 10 | DDL, DML, WHERE, LIMIT, JOIN, GROUP BY, aggregates |
-| Volcano operators | 6 | SeqScan, Filter, Project, Limit, HashJoin, HashAggregate |
-| Integration | 5 | Crash semantics, recovery round-trip, WAL replay |
+| SQL parser | 17 | Tokenizer, AST, case-insensitive, strings, expressions |
+| Volcano operators | 10 | SeqScan, Filter, Project, Limit, HashJoin, HashAggregate |
+| Parser fuzz | 4 | 8K random inputs, no panics |
+| Soak test | 1 | 10K row lifecycle across 5 tables |
 | Wire protocol | 1 | TCP e2e (multi-client, shared engine) |
-| **Total** | **50+** | **All green, clippy clean** |
+| Embedded API | 2 | JSON API contract |
+| **Total** | **85** | **All green, clippy clean** |
 
 ---
 
