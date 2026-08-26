@@ -210,6 +210,7 @@ impl Operator for HashJoin {
 pub enum AggFn {
     Count,
     Sum,
+    Avg,
     Min,
     Max,
 }
@@ -265,6 +266,24 @@ impl HashAggregate {
                         }
                     }
                     SqlValue::Int(acc)
+                }
+                AggFn::Avg => {
+                    let mut acc = 0i64;
+                    let mut cnt = 0i64;
+                    for v in &vals {
+                        match v {
+                            SqlValue::Int(i) => {
+                                acc += i;
+                                cnt += 1;
+                            }
+                            _ => return Err("AVG requires INTEGER".into()),
+                        }
+                    }
+                    if cnt == 0 {
+                        SqlValue::Null
+                    } else {
+                        SqlValue::Int(acc / cnt)
+                    }
                 }
                 AggFn::Min | AggFn::Max => {
                     let want_min = *f == AggFn::Min;
