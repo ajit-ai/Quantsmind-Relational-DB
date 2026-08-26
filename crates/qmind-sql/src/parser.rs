@@ -110,13 +110,7 @@ pub enum BinOp {
     And,
 }
 
-/// Re-export sqlvalue for downstream consumers (engine uses this in WHERE eval).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SqlValue {
-    Int(i64),
-    Text(String),
-    Null,
-}
+use crate::codec::SqlValue;
 
 // ── Tokenizer ───────────────────────────────────────────────────────────────
 
@@ -165,12 +159,30 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>, String> {
     while i < len {
         match chars[i] {
             c if c.is_ascii_whitespace() => i += 1,
-            '(' => { tokens.push(Token::LParen); i += 1; }
-            ')' => { tokens.push(Token::RParen); i += 1; }
-            ',' => { tokens.push(Token::Comma); i += 1; }
-            '*' => { tokens.push(Token::Star); i += 1; }
-            ';' => { tokens.push(Token::Semicolon); i += 1; }
-            '=' => { tokens.push(Token::Eq); i += 1; }
+            '(' => {
+                tokens.push(Token::LParen);
+                i += 1;
+            }
+            ')' => {
+                tokens.push(Token::RParen);
+                i += 1;
+            }
+            ',' => {
+                tokens.push(Token::Comma);
+                i += 1;
+            }
+            '*' => {
+                tokens.push(Token::Star);
+                i += 1;
+            }
+            ';' => {
+                tokens.push(Token::Semicolon);
+                i += 1;
+            }
+            '=' => {
+                tokens.push(Token::Eq);
+                i += 1;
+            }
             '!' if i + 1 < len && chars[i + 1] == '=' => {
                 tokens.push(Token::NotEq);
                 i += 2;
@@ -179,12 +191,18 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>, String> {
                 tokens.push(Token::LtEq);
                 i += 2;
             }
-            '<' => { tokens.push(Token::Lt); i += 1; }
+            '<' => {
+                tokens.push(Token::Lt);
+                i += 1;
+            }
             '>' if i + 1 < len && chars[i + 1] == '=' => {
                 tokens.push(Token::GtEq);
                 i += 2;
             }
-            '>' => { tokens.push(Token::Gt); i += 1; }
+            '>' => {
+                tokens.push(Token::Gt);
+                i += 1;
+            }
             '\'' => {
                 i += 1;
                 let mut s = String::new();
@@ -203,16 +221,24 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>, String> {
                 i += 1; // closing '
                 tokens.push(Token::Str(s));
             }
-            c if c.is_ascii_digit() || (c == '-' && i + 1 < len && chars[i + 1].is_ascii_digit()) => {
+            c if c.is_ascii_digit()
+                || (c == '-' && i + 1 < len && chars[i + 1].is_ascii_digit()) =>
+            {
                 let negative = c == '-';
-                if negative { i += 1; }
+                if negative {
+                    i += 1;
+                }
                 let start = i;
                 while i < len && chars[i].is_ascii_digit() {
                     i += 1;
                 }
                 let num_str: String = chars[start..i].iter().collect();
-                let mut n: i64 = num_str.parse().map_err(|_| format!("invalid number: {num_str}"))?;
-                if negative { n = -n; }
+                let mut n: i64 = num_str
+                    .parse()
+                    .map_err(|_| format!("invalid number: {num_str}"))?;
+                if negative {
+                    n = -n;
+                }
                 tokens.push(Token::Int(n));
             }
             c if c.is_ascii_alphabetic() || c == '_' => {
@@ -268,7 +294,9 @@ impl Parser {
 
     fn advance(&mut self) -> Token {
         let t = self.tokens.get(self.pos).cloned().unwrap_or(Token::Eof);
-        if !self.at_end() { self.pos += 1; }
+        if !self.at_end() {
+            self.pos += 1;
+        }
         t
     }
 
@@ -318,7 +346,11 @@ impl Parser {
         self.expect_paren_open()?;
         let columns = self.parse_comma_separated(Self::parse_column_def)?;
         self.expect_paren_close()?;
-        Ok(Statement::CreateTable { name, columns, if_not_exists })
+        Ok(Statement::CreateTable {
+            name,
+            columns,
+            if_not_exists,
+        })
     }
 
     fn parse_column_def(&mut self) -> Result<Column, String> {
@@ -330,13 +362,21 @@ impl Parser {
             self.expect_keyword("NULL")?;
             not_null = true;
         }
-        Ok(Column { name, data_type, not_null })
+        Ok(Column {
+            name,
+            data_type,
+            not_null,
+        })
     }
 
     fn parse_data_type(&mut self) -> Result<DataType, String> {
         match self.advance() {
-            Token::Keyword("INTEGER") | Token::Keyword("INT") | Token::Keyword("BIGINT") => Ok(DataType::Integer),
-            Token::Keyword("TEXT") | Token::Keyword("VARCHAR") | Token::Keyword("STRING") => Ok(DataType::Text),
+            Token::Keyword("INTEGER") | Token::Keyword("INT") | Token::Keyword("BIGINT") => {
+                Ok(DataType::Integer)
+            }
+            Token::Keyword("TEXT") | Token::Keyword("VARCHAR") | Token::Keyword("STRING") => {
+                Ok(DataType::Text)
+            }
             t => Err(format!("unsupported data type, got {t:?}")),
         }
     }
@@ -383,7 +423,13 @@ impl Parser {
             limit = Some(self.parse_limit_value()?);
         }
 
-        Ok(Select { projection, from, selection, group_by, limit })
+        Ok(Select {
+            projection,
+            from,
+            selection,
+            group_by,
+            limit,
+        })
     }
 
     fn parse_select_list(&mut self) -> Result<Vec<SelectItem>, String> {
@@ -521,11 +567,23 @@ impl Parser {
                     self.parse_expr()?
                 };
                 self.expect_paren_close()?;
-                Ok(Expr::Function { name, args: vec![arg] })
+                Ok(Expr::Function {
+                    name,
+                    args: vec![arg],
+                })
             }
-            Token::Int(n) => { self.advance(); Ok(Expr::Literal(SqlValue::Int(n))) }
-            Token::Str(s) => { self.advance(); Ok(Expr::Literal(SqlValue::Text(s))) }
-            Token::Keyword("NULL") => { self.advance(); Ok(Expr::Literal(SqlValue::Null)) }
+            Token::Int(n) => {
+                self.advance();
+                Ok(Expr::Literal(SqlValue::Int(n)))
+            }
+            Token::Str(s) => {
+                self.advance();
+                Ok(Expr::Literal(SqlValue::Text(s)))
+            }
+            Token::Keyword("NULL") => {
+                self.advance();
+                Ok(Expr::Literal(SqlValue::Null))
+            }
             Token::LParen => {
                 self.advance();
                 let e = self.parse_and_expr()?;
@@ -598,7 +656,11 @@ mod tests {
     fn parse_create_table() {
         let stmts = Parser::parse("CREATE TABLE t (id INTEGER NOT NULL, name TEXT)").unwrap();
         match &stmts[0] {
-            Statement::CreateTable { name, columns, if_not_exists } => {
+            Statement::CreateTable {
+                name,
+                columns,
+                if_not_exists,
+            } => {
                 assert_eq!(name, "t");
                 assert!(!if_not_exists);
                 assert_eq!(columns.len(), 2);
@@ -624,8 +686,7 @@ mod tests {
 
     #[test]
     fn parse_insert_multiple_rows() {
-        let stmts =
-            Parser::parse("INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
+        let stmts = Parser::parse("INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
         match &stmts[0] {
             Statement::Insert { table, rows } => {
                 assert_eq!(table, "t");
@@ -654,8 +715,7 @@ mod tests {
 
     #[test]
     fn parse_select_with_where_and_limit() {
-        let stmts =
-            Parser::parse("SELECT a, b FROM t WHERE a > 5 AND b = 'x' LIMIT 10").unwrap();
+        let stmts = Parser::parse("SELECT a, b FROM t WHERE a > 5 AND b = 'x' LIMIT 10").unwrap();
         match &stmts[0] {
             Statement::Select(sel) => {
                 assert_eq!(sel.projection.len(), 2);
@@ -683,8 +743,7 @@ mod tests {
 
     #[test]
     fn parse_group_by() {
-        let stmts =
-            Parser::parse("SELECT tag, COUNT(*), SUM(v) FROM s GROUP BY tag").unwrap();
+        let stmts = Parser::parse("SELECT tag, COUNT(*), SUM(v) FROM s GROUP BY tag").unwrap();
         match &stmts[0] {
             Statement::Select(sel) => {
                 assert_eq!(sel.projection.len(), 3);
@@ -761,10 +820,9 @@ mod tests {
     #[test]
     fn e2e_create_insert_select() {
         // Full round-trip parse: parse SQL, verify AST structure
-        let stmts = Parser::parse(
-            "CREATE TABLE users (id INTEGER NOT NULL, name TEXT, salary INTEGER)",
-        )
-        .unwrap();
+        let stmts =
+            Parser::parse("CREATE TABLE users (id INTEGER NOT NULL, name TEXT, salary INTEGER)")
+                .unwrap();
         assert_eq!(stmts.len(), 1);
 
         let stmts =
