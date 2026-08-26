@@ -155,10 +155,22 @@ jobs:
         with:
           path: artifacts
 
+      - name: Collect all artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.deb" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.dmg" -o -name "*.app" \) -exec cp {} release/ \;
+
+      - name: Generate checksums
+        working-directory: release
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           draft: true
           generate_release_notes: true
           files: |
-            artifacts/**/*
+            release/*

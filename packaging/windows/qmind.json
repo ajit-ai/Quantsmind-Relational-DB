@@ -1,0 +1,27 @@
+{
+    "version": "0.1.0",
+    "description": "QuantsMind Relational Database Engine",
+    "homepage": "https://github.com/ajit-ai/Quantsmind-Relational-DB",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/ajit-ai/Quantsmind-Relational-DB/releases/download/v0.1.0/qmind-windows-x64-0.1.0.zip",
+            "hash": "TO_BE_FILLED_AFTER_RELEASE"
+        }
+    },
+    "bin": [
+        "qmind-server.exe",
+        "qmind-cli.exe"
+    ],
+    "persist": "data",
+    "checkver": {
+        "github": "https://github.com/ajit-ai/Quantsmind-Relational-DB"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/ajit-ai/Quantsmind-Relational-DB/releases/download/v$version/qmind-windows-x64-$version.zip"
+            }
+        }
+    }
+}
