@@ -12,6 +12,7 @@
 
 pub mod btree;
 pub mod buffer;
+pub mod columnar;
 pub mod error;
 pub mod eviction;
 pub mod lock;
