@@ -1,19 +1,16 @@
 //! M3 SQL engine: parse → plan-lite → execute over the MVCC kernel.
 //!
-//! Supported surface (grows per ROADMAP.md):
-//! - CREATE TABLE t (col TYPE [NOT NULL], ...)
+//! Uses the handwritten parser (E5) for SQL surface:
+//! - CREATE TABLE t (col TYPE [NOT NULL], ...) [IF NOT EXISTS]
 //! - INSERT INTO t VALUES (..), (..)
-//! - SELECT cols | * FROM t [WHERE cond] [LIMIT n]
-//!   predicates: col op literal chained with AND; ops = != < <= > >=
+//! - SELECT cols | * FROM t [INNER JOIN t ON col = col] [WHERE cond]
+//!   [GROUP BY col] [LIMIT n]
 
 use crate::codec::{decode_row, encode_row, row_key, ColumnDef, ColumnType, SqlValue};
 use crate::executor::Row;
 use crate::executor::{Filter, HashAggregate, HashJoin, Limit, Operator, Project, VecScan};
+use crate::parser::{self, BinOp, DataType, Expr, SelectItem, Statement, TableRef};
 use qmind_kernel::{MvccStore, WalWriter};
-use sqlparser::ast::{
-    BinaryOperator, Expr, JoinConstraint, ObjectName, Statement, Value as SqlParserValue,
-};
-use sqlparser::parser::Parser;
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -55,17 +52,7 @@ impl<W: Write> Engine<W> {
 
     /// Parse + execute a single statement.
     pub fn execute(&mut self, sql: &str) -> Result<ExecResult, String> {
-        if sql.trim().to_uppercase().starts_with("SHOW TABLES") {
-            let mut names: Vec<String> = self.tables.keys().cloned().collect();
-            names.sort();
-            return Ok(ExecResult {
-                columns: vec!["table".into()],
-                rows: names.into_iter().map(|n| vec![SqlValue::Text(n)]).collect(),
-                rows_affected: 0,
-            });
-        }
-        let stmts = Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, sql)
-            .map_err(|e| format!("syntax error: {e}"))?;
+        let stmts = parser::Parser::parse(sql)?;
         if stmts.len() != 1 {
             return Err(format!(
                 "expected exactly one statement, got {}",
@@ -73,69 +60,65 @@ impl<W: Write> Engine<W> {
             ));
         }
         match &stmts[0] {
-            Statement::CreateTable(ct) => self.create_table(ct),
-            Statement::Insert(ins) => self.insert(ins),
-            Statement::Query(q) => self.select(q),
-            other => Err(format!("unsupported statement: {other:?}")),
+            Statement::CreateTable {
+                name,
+                columns,
+                if_not_exists,
+            } => self.create_table(name, columns, *if_not_exists),
+            Statement::Insert { table, rows } => self.insert(table, rows),
+            Statement::Select(sel) => self.select(sel),
+            Statement::ShowTables => {
+                let mut names: Vec<String> = self.tables.keys().cloned().collect();
+                names.sort();
+                Ok(ExecResult {
+                    columns: vec!["table".into()],
+                    rows: names.into_iter().map(|n| vec![SqlValue::Text(n)]).collect(),
+                    rows_affected: 0,
+                })
+            }
         }
     }
 
-    fn create_table(&mut self, ct: &sqlparser::ast::CreateTable) -> Result<ExecResult, String> {
-        let name = object_name(&ct.name)?;
-        if self.tables.contains_key(&name) {
-            if ct.if_not_exists {
+    fn create_table(
+        &mut self,
+        name: &str,
+        columns: &[parser::Column],
+        if_not_exists: bool,
+    ) -> Result<ExecResult, String> {
+        if self.tables.contains_key(name) {
+            if if_not_exists {
                 return Ok(ExecResult::empty());
             }
             return Err(format!("table `{name}` already exists"));
         }
         let mut cols = Vec::new();
-        for col in &ct.columns {
-            let ty = match &col.data_type {
-                sqlparser::ast::DataType::Integer(_)
-                | sqlparser::ast::DataType::BigInt(_)
-                | sqlparser::ast::DataType::Int(_) => ColumnType::Int,
-                sqlparser::ast::DataType::Text
-                | sqlparser::ast::DataType::Varchar(_)
-                | sqlparser::ast::DataType::String(_) => ColumnType::Text,
-                other => {
-                    return Err(format!(
-                        "unsupported type {other:?} for column {}",
-                        col.name
-                    ))
-                }
+        for col in columns {
+            let ty = match col.data_type {
+                DataType::Integer => ColumnType::Int,
+                DataType::Text => ColumnType::Text,
             };
-            let not_null = col
-                .options
-                .iter()
-                .any(|o| matches!(o.option, sqlparser::ast::ColumnOption::NotNull));
             cols.push(ColumnDef {
-                name: col.name.value.clone(),
+                name: col.name.clone(),
                 ty,
-                nullable: !not_null,
+                nullable: !col.not_null,
             });
         }
-        self.tables.insert(name.clone(), cols);
-        self.next_row_id.entry(name).or_insert(0);
+        self.tables.insert(name.to_string(), cols);
+        self.next_row_id.entry(name.to_string()).or_insert(0);
         Ok(ExecResult::empty())
     }
 
-    fn insert(&mut self, ins: &sqlparser::ast::Insert) -> Result<ExecResult, String> {
-        let table = object_name(&ins.table_name)?;
+    fn insert(&mut self, table: &str, rows: &[Vec<Expr>]) -> Result<ExecResult, String> {
         let schema = self
             .tables
-            .get(&table)
+            .get(table)
             .cloned()
             .ok_or_else(|| format!("no table `{table}`"))?;
 
-        let rows_data = match ins.source.as_ref().map(|b| b.body.as_ref()) {
-            Some(sqlparser::ast::SetExpr::Values(v)) => &v.rows,
-            _ => return Err("only VALUES inserts supported".into()),
-        };
-
         let (txn, _snap) = self.db.begin();
-        let start_id = *self.next_row_id.entry(table.clone()).or_insert(0);
+        let start_id = *self.next_row_id.entry(table.to_string()).or_insert(0);
         let mut count = 0u64;
-        for row_expr in rows_data {
+        for row_expr in rows {
             if row_expr.len() != schema.len() {
                 return Err(format!(
                     "table `{table}` has {} columns, got {}",
@@ -156,10 +139,10 @@ impl<W: Write> Engine<W> {
                 row.push(v);
             }
             let rid = start_id + count;
-            self.db.set(txn, &row_key(&table, rid), encode_row(&row));
+            self.db.set(txn, &row_key(table, rid), encode_row(&row));
             count += 1;
         }
-        *self.next_row_id.get_mut(&table).unwrap() += count;
+        *self.next_row_id.get_mut(table).unwrap() += count;
 
         let logged = self
             .db
@@ -179,23 +162,15 @@ impl<W: Write> Engine<W> {
         })
     }
 
-    fn select(&mut self, q: &sqlparser::ast::Query) -> Result<ExecResult, String> {
-        let body = match q.body.as_ref() {
-            sqlparser::ast::SetExpr::Select(sel) => sel,
-            _ => return Err("only simple SELECT supported".into()),
-        };
-
-        // M4c: two-table INNER JOIN ... ON equi-condition → hash join.
-        if !body.from.is_empty() && !body.from[0].joins.is_empty() {
-            return self.select_join(body, &q.limit);
+    fn select(&mut self, sel: &parser::Select) -> Result<ExecResult, String> {
+        // JOIN path.
+        if matches!(&sel.from, TableRef::Join { .. }) {
+            return self.select_join(sel);
         }
 
-        let table = match body.from.first() {
-            Some(f) => match &f.relation {
-                sqlparser::ast::TableFactor::Table { name, .. } => object_name(name)?,
-                other => return Err(format!("unsupported FROM clause {other:?}")),
-            },
-            None => return Err("SELECT requires FROM".into()),
+        let table = match &sel.from {
+            TableRef::Table(t) => t.clone(),
+            _ => unreachable!(),
         };
         let schema = self
             .tables
@@ -203,16 +178,13 @@ impl<W: Write> Engine<W> {
             .cloned()
             .ok_or_else(|| format!("no table `{table}`"))?;
 
-        // GROUP BY path: aggregates + grouping columns bucketed per key.
-        if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &body.group_by {
-            if !exprs.is_empty() {
-                return self.select_group_by(body, exprs, &schema, &table);
-            }
+        // GROUP BY path.
+        if !sel.group_by.is_empty() {
+            return self.select_group_by(sel, &schema, &table);
         }
 
-        // Aggregate fast path: SELECT COUNT(*)|COUNT(c)|SUM|AVG|MIN|MAX(c)
-        // [WHERE cond].
-        if let Some(aggs) = try_parse_aggregates(&body.projection, &schema)? {
+        // Aggregate fast path (no GROUP BY).
+        if let Some(aggs) = try_parse_aggregates(&sel.projection, &schema)? {
             let (_, snap) = self.db.begin();
             let mut rows = Vec::new();
             for rid in 0..*self.next_row_id.get(&table).unwrap_or(&0) {
@@ -223,7 +195,7 @@ impl<W: Write> Engine<W> {
                 let Some(full) = decode_row(&raw, &schema) else {
                     continue;
                 };
-                match &body.selection {
+                match &sel.selection {
                     Some(pred) if !eval_predicate(pred, &schema, &full)? => continue,
                     _ => rows.push(full),
                 }
@@ -244,48 +216,44 @@ impl<W: Write> Engine<W> {
             All,
             Cols(Vec<usize>),
         }
-        let (proj, out_cols) = if body.projection.len() == 1
-            && matches!(body.projection[0], sqlparser::ast::SelectItem::Wildcard(_))
-        {
-            (
-                Proj::All,
-                schema.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
-            )
-        } else {
-            let mut idx = Vec::new();
-            let mut names = Vec::new();
-            for item in &body.projection {
-                let sqlparser::ast::SelectItem::UnnamedExpr(Expr::Identifier(id)) = item else {
-                    return Err("only plain column projections supported".into());
-                };
-                let pos = schema
-                    .iter()
-                    .position(|c| c.name == id.value)
-                    .ok_or_else(|| format!("unknown column {}", id.value))?;
-                idx.push(pos);
-                names.push(id.value.clone());
-            }
-            (Proj::Cols(idx), names)
-        };
+        let (proj, out_cols) =
+            if sel.projection.len() == 1 && matches!(sel.projection[0], SelectItem::Star) {
+                (
+                    Proj::All,
+                    schema.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                )
+            } else {
+                let mut idx = Vec::new();
+                let mut names = Vec::new();
+                for item in &sel.projection {
+                    let SelectItem::Expr(Expr::Identifier(id)) = item else {
+                        return Err("only plain column projections supported".into());
+                    };
+                    let pos = schema
+                        .iter()
+                        .position(|c| c.name == id.as_str())
+                        .ok_or_else(|| format!("unknown column {id}"))?;
+                    idx.push(pos);
+                    names.push(id.clone());
+                }
+                (Proj::Cols(idx), names)
+            };
 
-        // E4b: materialize the MVCC scan, then run the Volcano pipeline
-        // VecScan → Filter → Project → Limit. (Storage-side streaming Scan
-        // replaces this pre-step when the snapshot iterator lands.)
+        // E4b: materialize the MVCC scan, then run the Volcano pipeline.
         let (_, snap) = self.db.begin();
-        let max_rows = limit_literal(&q.limit)?;
+        let max_rows = sel.limit.unwrap_or(0);
         let mut raw_rows: Vec<Row> = Vec::new();
         for rid in 0..*self.next_row_id.get(&table).unwrap_or(&0) {
             let key = row_key(&table, rid);
-            let Some(raw) = self.db.get_raw(&key, &snap) else {
-                continue;
-            };
-            if let Some(full) = decode_row(&raw, &schema) {
-                raw_rows.push(full);
+            if let Some(raw) = self.db.get_raw(&key, &snap) {
+                if let Some(full) = decode_row(&raw, &schema) {
+                    raw_rows.push(full);
+                }
             }
         }
 
         let mut op: Box<dyn Operator> = Box::new(VecScan::new(raw_rows));
-        if let Some(pred) = &body.selection {
+        if let Some(pred) = &sel.selection {
             let s = schema.clone();
             let p: Expr = pred.clone();
             op = Box::new(Filter::new(op, move |r: &Row| eval_predicate(&p, &s, r)));
@@ -310,49 +278,34 @@ impl<W: Write> Engine<W> {
         })
     }
 
-    /// M4c: hash join for left INNER JOIN right ON lcol = rcol.
-    /// Builds a hash table over the right side, probes with left rows,
-    /// then applies WHERE / projection / LIMIT on the concatenated rows.
-    fn select_join(
-        &mut self,
-        body: &sqlparser::ast::Select,
-        limit: &Option<Expr>,
-    ) -> Result<ExecResult, String> {
-        let left_rel = &body.from[0].relation;
-        let (lt, rt) = match (&left_rel, body.from[0].joins.first().map(|j| &j.relation)) {
-            (
-                sqlparser::ast::TableFactor::Table { name: ln, .. },
-                Some(sqlparser::ast::TableFactor::Table { name: rn, .. }),
-            ) => (object_name(ln)?, object_name(rn)?),
-            _ => return Err("JOIN supports plain tables only".into()),
+    fn select_join(&mut self, sel: &parser::Select) -> Result<ExecResult, String> {
+        let (left, right, on_expr) = match &sel.from {
+            TableRef::Join { left, right, on } => match left.as_ref() {
+                TableRef::Table(lt) => (lt.clone(), right.clone(), on.clone()),
+                _ => return Err("JOIN left side must be a table".into()),
+            },
+            _ => unreachable!(),
         };
-        if lt == rt {
+        if left == right {
             return Err("self-joins unsupported".into());
         }
         let lschema = self
             .tables
-            .get(&lt)
+            .get(&left)
             .cloned()
-            .ok_or_else(|| format!("no table `{lt}`"))?;
+            .ok_or_else(|| format!("no table `{left}`"))?;
         let rschema = self
             .tables
-            .get(&rt)
+            .get(&right)
             .cloned()
-            .ok_or_else(|| format!("no table `{rt}`"))?;
+            .ok_or_else(|| format!("no table `{right}`"))?;
 
-        // Join predicate must be exactly col = col.
-        let on = match &body.from[0].joins[0].join_operator {
-            sqlparser::ast::JoinOperator::Inner(JoinConstraint::On(e)) => Ok(e.clone()),
-            sqlparser::ast::JoinOperator::Inner(other) => {
-                Err(format!("unsupported JOIN constraint {other:?}"))
-            }
-            other => Err(format!("only INNER JOIN supported, got {other:?}")),
-        }?;
+        // JOIN ON must be exactly col = col.
         let Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } = on
+            left: on_l,
+            op: BinOp::Eq,
+            right: on_r,
+        } = on_expr
         else {
             return Err("JOIN ON must be an equality".into());
         };
@@ -375,11 +328,11 @@ impl<W: Write> Engine<W> {
             let Expr::Identifier(id) = e else {
                 return Err("JOIN ON sides must be columns".into());
             };
-            find_col(&id.value).ok_or_else(|| format!("unknown column {}", id.value))
+            find_col(id).ok_or_else(|| format!("unknown column {id}"))
         };
         let (lside, rside) = {
-            let a = resolve_side(&left)?;
-            let b = resolve_side(&right)?;
+            let a = resolve_side(&on_l)?;
+            let b = resolve_side(&on_r)?;
             match (a.0, b.0) {
                 (true, false) => ((a.1 as u8, 0u8), (b.1 as u8, 1u8)),
                 (false, true) => ((b.1 as u8, 0u8), (a.1 as u8, 1u8)),
@@ -390,11 +343,11 @@ impl<W: Write> Engine<W> {
 
         // E4b-2: materialize both sides, then run Volcano pipeline.
         let (_, snap) = self.db.begin();
-        let max_rows = limit_literal(limit)?;
+        let max_rows = sel.limit.unwrap_or(0);
 
         let mut left_rows: Vec<Row> = Vec::new();
-        for rid in 0..*self.next_row_id.get(&lt).unwrap_or(&0) {
-            let key = row_key(&lt, rid);
+        for rid in 0..*self.next_row_id.get(&left).unwrap_or(&0) {
+            let key = row_key(&left, rid);
             if let Some(raw) = self.db.get_raw(&key, &snap) {
                 if let Some(row) = decode_row(&raw, &lschema) {
                     left_rows.push(row);
@@ -402,8 +355,8 @@ impl<W: Write> Engine<W> {
             }
         }
         let mut right_rows: Vec<Row> = Vec::new();
-        for rid in 0..*self.next_row_id.get(&rt).unwrap_or(&0) {
-            let key = row_key(&rt, rid);
+        for rid in 0..*self.next_row_id.get(&right).unwrap_or(&0) {
+            let key = row_key(&right, rid);
             if let Some(raw) = self.db.get_raw(&key, &snap) {
                 if let Some(row) = decode_row(&raw, &rschema) {
                     right_rows.push(row);
@@ -419,7 +372,7 @@ impl<W: Write> Engine<W> {
             lschema.len(),
         )?);
 
-        if let Some(pred) = &body.selection {
+        if let Some(pred) = &sel.selection {
             let c = combined.clone();
             let p: Expr = pred.clone();
             op = Box::new(Filter::new(op, move |r: &Row| eval_predicate(&p, &c, r)));
@@ -430,27 +383,25 @@ impl<W: Write> Engine<W> {
             All,
             Cols(Vec<usize>),
         }
-        let (proj, out_cols) = if body.projection.len() == 1
-            && matches!(body.projection[0], sqlparser::ast::SelectItem::Wildcard(_))
-        {
-            (
-                Proj2::All,
-                combined.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
-            )
-        } else {
-            let mut idx = Vec::new();
-            let mut names = Vec::new();
-            for item in &body.projection {
-                let sqlparser::ast::SelectItem::UnnamedExpr(Expr::Identifier(id)) = item else {
-                    return Err("only plain column projections supported on joins".into());
-                };
-                let (is_l, p) =
-                    find_col(&id.value).ok_or_else(|| format!("unknown column {}", id.value))?;
-                idx.push(if is_l { p } else { lschema.len() + p });
-                names.push(id.value.clone());
-            }
-            (Proj2::Cols(idx), names)
-        };
+        let (proj, out_cols) =
+            if sel.projection.len() == 1 && matches!(sel.projection[0], SelectItem::Star) {
+                (
+                    Proj2::All,
+                    combined.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                )
+            } else {
+                let mut idx = Vec::new();
+                let mut names = Vec::new();
+                for item in &sel.projection {
+                    let SelectItem::Expr(Expr::Identifier(id)) = item else {
+                        return Err("only plain column projections supported on joins".into());
+                    };
+                    let (is_l, p) = find_col(id).ok_or_else(|| format!("unknown column {id}"))?;
+                    idx.push(if is_l { p } else { lschema.len() + p });
+                    names.push(id.clone());
+                }
+                (Proj2::Cols(idx), names)
+            };
 
         op = match &proj {
             Proj2::All => op,
@@ -472,27 +423,22 @@ impl<W: Write> Engine<W> {
             rows_affected: 0,
         })
     }
-    /// GROUP BY execution: bucket filtered rows by grouping-key tuple, then
-    /// evaluate each aggregate per bucket. Output is ordered by group key
-    /// (BTreeMap) — deterministic without an explicit ORDER BY.
+
     fn select_group_by(
         &mut self,
-        body: &sqlparser::ast::Select,
-        exprs: &[Expr],
+        sel: &parser::Select,
         schema: &[ColumnDef],
         table: &str,
     ) -> Result<ExecResult, String> {
-        use sqlparser::ast::{FunctionArg, FunctionArgExpr};
-
-        let mut key_idx = Vec::with_capacity(exprs.len());
-        for e in exprs {
+        let mut key_idx = Vec::with_capacity(sel.group_by.len());
+        for e in &sel.group_by {
             let Expr::Identifier(id) = e else {
                 return Err("GROUP BY supports plain columns only".into());
             };
             let pos = schema
                 .iter()
-                .position(|c| c.name == id.value)
-                .ok_or_else(|| format!("unknown column {}", id.value))?;
+                .position(|c| c.name == id.as_str())
+                .ok_or_else(|| format!("unknown column {id}"))?;
             key_idx.push(pos);
         }
 
@@ -502,13 +448,10 @@ impl<W: Write> Engine<W> {
         }
         let mut items = Vec::new();
         let mut out_cols = Vec::new();
-        for item in &body.projection {
-            let sqlparser::ast::SelectItem::UnnamedExpr(e) = item else {
-                return Err("GROUP BY projection must be plain expressions".into());
-            };
-            match e {
-                Expr::Function(f) => {
-                    let fname = f.name.to_string().to_uppercase();
+        for item in &sel.projection {
+            match item {
+                SelectItem::Expr(Expr::Function { name, args }) => {
+                    let fname = name.to_uppercase();
                     let func = match fname.as_str() {
                         "COUNT" => AggFn::Count,
                         "SUM" => AggFn::Sum,
@@ -517,27 +460,22 @@ impl<W: Write> Engine<W> {
                         "MAX" => AggFn::Max,
                         other => return Err(format!("unsupported function {other}")),
                     };
-                    let arg0: Option<FunctionArgExpr> = match &f.args {
-                        sqlparser::ast::FunctionArguments::None => None,
-                        sqlparser::ast::FunctionArguments::List(l) => {
-                            l.args.first().map(|a| match a {
-                                FunctionArg::Unnamed(n) => n.clone(),
-                                FunctionArg::Named { arg, .. } => arg.clone(),
-                            })
+                    let col = if args.is_empty() {
+                        None
+                    } else {
+                        let Expr::Identifier(col_name) = &args[0] else {
+                            return Err(format!("{fname} requires a column or *"));
+                        };
+                        if col_name == "*" {
+                            None
+                        } else {
+                            Some(
+                                schema
+                                    .iter()
+                                    .position(|c| c.name == col_name.as_str())
+                                    .ok_or_else(|| format!("unknown column {col_name}"))?,
+                            )
                         }
-                        sqlparser::ast::FunctionArguments::Subquery(_) => {
-                            return Err(format!("{fname}(subquery) unsupported"));
-                        }
-                    };
-                    let col = match arg0 {
-                        Some(FunctionArgExpr::Wildcard) => None,
-                        Some(FunctionArgExpr::Expr(Expr::Identifier(id))) => Some(
-                            schema
-                                .iter()
-                                .position(|c| c.name == id.value)
-                                .ok_or_else(|| format!("unknown column {}", id.value))?,
-                        ),
-                        _ => return Err(format!("{fname} requires a single argument")),
                     };
                     out_cols.push(format!(
                         "{fname}({})",
@@ -549,18 +487,17 @@ impl<W: Write> Engine<W> {
                         col,
                     }));
                 }
-                Expr::Identifier(id) => {
+                SelectItem::Expr(Expr::Identifier(id)) => {
                     let pos = schema
                         .iter()
-                        .position(|c| c.name == id.value)
-                        .ok_or_else(|| format!("unknown column {}", id.value))?;
+                        .position(|c| c.name == id.as_str())
+                        .ok_or_else(|| format!("unknown column {id}"))?;
                     if !key_idx.contains(&pos) {
                         return Err(format!(
-                            "column {} must appear in GROUP BY or be aggregated",
-                            id.value
+                            "column {id} must appear in GROUP BY or be aggregated",
                         ));
                     }
-                    out_cols.push(id.value.clone());
+                    out_cols.push(id.clone());
                     items.push(Item::Key(pos));
                 }
                 other => return Err(format!("unsupported GROUP BY projection {other:?}")),
@@ -575,7 +512,7 @@ impl<W: Write> Engine<W> {
             let key = row_key(table, rid);
             if let Some(raw) = self.db.get_raw(&key, &snap) {
                 if let Some(full) = decode_row(&raw, schema) {
-                    if let Some(pred) = &body.selection {
+                    if let Some(pred) = &sel.selection {
                         if !eval_predicate(pred, schema, &full)? {
                             continue;
                         }
@@ -585,7 +522,6 @@ impl<W: Write> Engine<W> {
             }
         }
 
-        // Build aggs for HashAggregate (maps items list to AggFn + col).
         let mut aggs: Vec<(crate::executor::AggFn, Option<usize>)> = Vec::new();
         for item in &items {
             if let Item::Agg(a) = item {
@@ -607,8 +543,6 @@ impl<W: Write> Engine<W> {
             aggs,
         ));
 
-        // Map desired projection (interleaved Key/Agg) to HashAggregate
-        // output order (keys first, then aggs) via Project.
         let mut agg_counter = 0usize;
         let mut reorder: Vec<usize> = Vec::with_capacity(items.len());
         for item in &items {
@@ -637,25 +571,26 @@ impl<W: Write> Engine<W> {
     }
 }
 
+// == Expression evaluation ====================================================
+
 fn eval_predicate(pred: &Expr, schema: &[ColumnDef], row: &[SqlValue]) -> Result<bool, String> {
     match pred {
-        Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
+        Expr::BinaryOp { left, op, right } if *op == BinOp::And => {
             Ok(eval_predicate(left, schema, row)? && eval_predicate(right, schema, row)?)
         }
         Expr::BinaryOp { left, op, right } => {
             let lhs = col_value(left, schema, row)?;
             let rhs = literal_value(right)?;
             Ok(match op {
-                BinaryOperator::Eq => *lhs == rhs,
-                BinaryOperator::NotEq => *lhs != rhs,
-                BinaryOperator::Lt => compare(lhs, &rhs) == std::cmp::Ordering::Less,
-                BinaryOperator::LtEq => compare(lhs, &rhs) != std::cmp::Ordering::Greater,
-                BinaryOperator::Gt => compare(lhs, &rhs) == std::cmp::Ordering::Greater,
-                BinaryOperator::GtEq => compare(lhs, &rhs) != std::cmp::Ordering::Less,
-                other => return Err(format!("unsupported operator {other:?}")),
+                BinOp::Eq => *lhs == rhs,
+                BinOp::NotEq => *lhs != rhs,
+                BinOp::Lt => compare(lhs, &rhs) == std::cmp::Ordering::Less,
+                BinOp::LtEq => compare(lhs, &rhs) != std::cmp::Ordering::Greater,
+                BinOp::Gt => compare(lhs, &rhs) == std::cmp::Ordering::Greater,
+                BinOp::GtEq => compare(lhs, &rhs) != std::cmp::Ordering::Less,
+                BinOp::And => unreachable!(),
             })
         }
-        Expr::Nested(e) => eval_predicate(e, schema, row),
         other => Err(format!("unsupported predicate {other:?}")),
     }
 }
@@ -678,39 +613,16 @@ fn col_value<'a>(
     };
     let pos = schema
         .iter()
-        .position(|c| c.name == id.value)
-        .ok_or_else(|| format!("unknown column {}", id.value))?;
+        .position(|c| c.name == id.as_str())
+        .ok_or_else(|| format!("unknown column {id}"))?;
     row.get(pos).ok_or("column index out of range".to_string())
 }
 
 fn literal_value(expr: &Expr) -> Result<SqlValue, String> {
     match expr {
-        Expr::Value(SqlParserValue::Number(n, _)) => n
-            .parse::<i64>()
-            .map(SqlValue::Int)
-            .map_err(|_| format!("{n} is not an INTEGER")),
-        Expr::Value(SqlParserValue::SingleQuotedString(s)) => Ok(SqlValue::Text(s.clone())),
-        Expr::Value(SqlParserValue::Null) => Ok(SqlValue::Null),
+        Expr::Literal(v) => Ok(v.clone()),
         other => Err(format!("unsupported literal {other:?}")),
     }
-}
-
-fn limit_literal(limit: &Option<Expr>) -> Result<usize, String> {
-    match limit {
-        None => Ok(0), // 0 = unlimited
-        Some(e) => match literal_value(e)? {
-            SqlValue::Int(n) if n >= 0 => Ok(n as usize),
-            _ => Err("LIMIT must be a non-negative integer".into()),
-        },
-    }
-}
-
-fn object_name(n: &ObjectName) -> Result<String, String> {
-    let parts: Vec<_> = n.0.iter().map(|p| p.value.clone()).collect();
-    if parts.len() != 1 {
-        return Err(format!("qualified names unsupported: {}", parts.join(".")));
-    }
-    Ok(parts.into_iter().next().expect("non-empty"))
 }
 
 // == M4 aggregates ==========================================================
@@ -724,8 +636,6 @@ enum AggFn {
     Max,
 }
 
-/// One aggregate projection; col is a pre-bound schema index
-/// (None = COUNT(*)).
 struct Aggregate {
     label: String,
     func: AggFn,
@@ -795,19 +705,15 @@ impl Aggregate {
 }
 
 fn try_parse_aggregates(
-    projection: &[sqlparser::ast::SelectItem],
+    projection: &[SelectItem],
     schema: &[ColumnDef],
 ) -> Result<Option<Vec<Aggregate>>, String> {
-    use sqlparser::ast::{FunctionArg, FunctionArgExpr};
     let mut out = Vec::with_capacity(projection.len());
     for item in projection {
-        let sqlparser::ast::SelectItem::UnnamedExpr(e) = item else {
+        let SelectItem::Expr(Expr::Function { name, args }) = item else {
             return Ok(None);
         };
-        let Expr::Function(f) = e else {
-            return Ok(None);
-        };
-        let fname = f.name.to_string().to_uppercase();
+        let fname = name.to_uppercase();
         let func = match fname.as_str() {
             "COUNT" => AggFn::Count,
             "SUM" => AggFn::Sum,
@@ -816,26 +722,21 @@ fn try_parse_aggregates(
             "MAX" => AggFn::Max,
             _ => continue,
         };
-        let arg0: Option<FunctionArgExpr> = match &f.args {
-            sqlparser::ast::FunctionArguments::None => None,
-            sqlparser::ast::FunctionArguments::Subquery(_) => {
-                return Err(format!("{fname}(subquery) unsupported"));
-            }
-            sqlparser::ast::FunctionArguments::List(l) => l.args.first().map(|a| match a {
-                FunctionArg::Unnamed(n) => n.clone(),
-                FunctionArg::Named { arg, .. } => arg.clone(),
-            }),
-        };
-        let col = match arg0 {
-            Some(FunctionArgExpr::Wildcard) => None,
-            Some(FunctionArgExpr::Expr(Expr::Identifier(id))) => {
+        let col = if args.is_empty() {
+            None
+        } else {
+            let Expr::Identifier(col_name) = &args[0] else {
+                return Err(format!("{fname} requires a column or *"));
+            };
+            if col_name == "*" {
+                None
+            } else {
                 let pos = schema
                     .iter()
-                    .position(|c| c.name == id.value)
-                    .ok_or_else(|| format!("unknown column {}", id.value))?;
+                    .position(|c| c.name == col_name.as_str())
+                    .ok_or_else(|| format!("unknown column {col_name}"))?;
                 Some(pos)
             }
-            _ => return Err(format!("{fname} requires a single argument")),
         };
         let label = format!("{fname}({})", if col.is_none() { "*" } else { "c" });
         out.push(Aggregate { label, func, col });

@@ -100,7 +100,7 @@ fn errors_are_clean_strings() {
     assert!(eng
         .execute("SELEKT nonsense")
         .unwrap_err()
-        .contains("syntax error"));
+        .contains("unsupported statement"));
     assert!(eng
         .execute("SELECT * FROM missing")
         .unwrap_err()

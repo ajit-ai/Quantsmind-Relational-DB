@@ -1,15 +1,10 @@
 [package]
 name = "qmind-sql"
-description = "QuantsMind SQL layer: parser, planner, vectorized executor"
+description = "QuantsMind SQL layer: handwritten parser, Volcano executor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 
-[features]
-default = ["sqlparser-dep"]
-sqlparser-dep = ["dep:sqlparser"]
-
 [dependencies]
 qmind-kernel = { workspace = true }
-sqlparser = { version = "0.50", optional = true }
