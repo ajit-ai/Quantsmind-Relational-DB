@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 
+[features]
+default = ["sqlparser-dep"]
+sqlparser-dep = ["dep:sqlparser"]
+
 [dependencies]
 qmind-kernel = { workspace = true }
-sqlparser = "0.50"
+sqlparser = { version = "0.50", optional = true }
