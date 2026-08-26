@@ -8,7 +8,7 @@
 
 use crate::codec::{decode_row, encode_row, row_key, ColumnDef, ColumnType, SqlValue};
 use crate::executor::Row;
-use crate::executor::{Filter, Limit, Operator, Project, VecScan};
+use crate::executor::{Filter, HashAggregate, HashJoin, Limit, Operator, Project, VecScan};
 use qmind_kernel::{MvccStore, WalWriter};
 use sqlparser::ast::{
     BinaryOperator, Expr, JoinConstraint, ObjectName, Statement, Value as SqlParserValue,
@@ -388,47 +388,41 @@ impl<W: Write> Engine<W> {
         };
         let (li, ri) = (lside.0 as usize, rside.0 as usize);
 
-        // Build phase: hash right rows by join key.
+        // E4b-2: materialize both sides, then run Volcano pipeline.
         let (_, snap) = self.db.begin();
-        let mut hash: std::collections::HashMap<SqlValue, Vec<Vec<SqlValue>>> =
-            std::collections::HashMap::new();
-        for rid in 0..*self.next_row_id.get(&rt).unwrap_or(&0) {
-            let key = row_key(&rt, rid);
-            let Some(raw) = self.db.get_raw(&key, &snap) else {
-                continue;
-            };
-            let Some(row) = decode_row(&raw, &rschema) else {
-                continue;
-            };
-            if row[ri] == SqlValue::Null {
-                continue;
-            }
-            hash.entry(row[ri].clone()).or_default().push(row);
-        }
+        let max_rows = limit_literal(limit)?;
 
-        // Probe phase.
-        let mut joined: Vec<Vec<SqlValue>> = Vec::new();
+        let mut left_rows: Vec<Row> = Vec::new();
         for rid in 0..*self.next_row_id.get(&lt).unwrap_or(&0) {
             let key = row_key(&lt, rid);
-            let Some(raw) = self.db.get_raw(&key, &snap) else {
-                continue;
-            };
-            let Some(lrow) = decode_row(&raw, &lschema) else {
-                continue;
-            };
-            if lrow[li] == SqlValue::Null {
-                continue;
+            if let Some(raw) = self.db.get_raw(&key, &snap) {
+                if let Some(row) = decode_row(&raw, &lschema) {
+                    left_rows.push(row);
+                }
             }
-            if let Some(matches) = hash.get(&lrow[li]) {
-                for rrow in matches {
-                    joined.push(lrow.iter().chain(rrow.iter()).cloned().collect());
+        }
+        let mut right_rows: Vec<Row> = Vec::new();
+        for rid in 0..*self.next_row_id.get(&rt).unwrap_or(&0) {
+            let key = row_key(&rt, rid);
+            if let Some(raw) = self.db.get_raw(&key, &snap) {
+                if let Some(row) = decode_row(&raw, &rschema) {
+                    right_rows.push(row);
                 }
             }
         }
 
-        // WHERE on combined row.
+        let mut op: Box<dyn Operator> = Box::new(HashJoin::new(
+            Box::new(VecScan::new(left_rows)),
+            Box::new(VecScan::new(right_rows)),
+            li,
+            ri,
+            lschema.len(),
+        )?);
+
         if let Some(pred) = &body.selection {
-            joined.retain(|r| eval_predicate(pred, &combined, r).unwrap_or(false));
+            let c = combined.clone();
+            let p: Expr = pred.clone();
+            op = Box::new(Filter::new(op, move |r: &Row| eval_predicate(&p, &c, r)));
         }
 
         // Projection.
@@ -458,16 +452,18 @@ impl<W: Write> Engine<W> {
             (Proj2::Cols(idx), names)
         };
 
-        let max_rows = limit_literal(limit)?;
+        op = match &proj {
+            Proj2::All => op,
+            Proj2::Cols(idx) => Box::new(Project::new(op, idx.clone())),
+        };
+
+        if max_rows > 0 {
+            op = Box::new(Limit::new(op, max_rows));
+        }
+
         let mut out_rows = Vec::new();
-        for full in joined {
-            if max_rows > 0 && out_rows.len() >= max_rows {
-                break;
-            }
-            out_rows.push(match &proj {
-                Proj2::All => full,
-                Proj2::Cols(idx) => idx.iter().map(|&i| full[i].clone()).collect(),
-            });
+        while let Some(r) = op.next()? {
+            out_rows.push(r);
         }
 
         Ok(ExecResult {
@@ -572,35 +568,65 @@ impl<W: Write> Engine<W> {
         }
 
         let (_, snap) = self.db.begin();
-        let mut buckets: std::collections::BTreeMap<Vec<SqlValue>, Vec<Vec<SqlValue>>> =
-            std::collections::BTreeMap::new();
+
+        // E4b-2: materialize filtered rows, then run Volcano pipeline.
+        let mut raw_rows: Vec<Row> = Vec::new();
         for rid in 0..*self.next_row_id.get(table).unwrap_or(&0) {
             let key = row_key(table, rid);
-            let Some(raw) = self.db.get_raw(&key, &snap) else {
-                continue;
-            };
-            let Some(full) = decode_row(&raw, schema) else {
-                continue;
-            };
-            if let Some(pred) = &body.selection {
-                if !eval_predicate(pred, schema, &full)? {
-                    continue;
+            if let Some(raw) = self.db.get_raw(&key, &snap) {
+                if let Some(full) = decode_row(&raw, schema) {
+                    if let Some(pred) = &body.selection {
+                        if !eval_predicate(pred, schema, &full)? {
+                            continue;
+                        }
+                    }
+                    raw_rows.push(full);
                 }
             }
-            let gkey: Vec<SqlValue> = key_idx.iter().map(|&i| full[i].clone()).collect();
-            buckets.entry(gkey).or_default().push(full);
         }
 
-        let mut rows = Vec::with_capacity(buckets.len());
-        for (_gk, bucket) in buckets {
-            let mut out = Vec::with_capacity(items.len());
-            for item in &items {
-                match item {
-                    Item::Key(i) => out.push(bucket[0][*i].clone()),
-                    Item::Agg(a) => out.push(a.evaluate(&bucket)?),
+        // Build aggs for HashAggregate (maps items list to AggFn + col).
+        let mut aggs: Vec<(crate::executor::AggFn, Option<usize>)> = Vec::new();
+        for item in &items {
+            if let Item::Agg(a) = item {
+                let f = match a.func {
+                    AggFn::Count => crate::executor::AggFn::Count,
+                    AggFn::Sum => crate::executor::AggFn::Sum,
+                    AggFn::Avg => crate::executor::AggFn::Avg,
+                    AggFn::Min => crate::executor::AggFn::Min,
+                    AggFn::Max => crate::executor::AggFn::Max,
+                };
+                aggs.push((f, a.col));
+            }
+        }
+
+        let nkeys = key_idx.len();
+        let mut op: Box<dyn Operator> = Box::new(HashAggregate::new(
+            Box::new(VecScan::new(raw_rows)),
+            key_idx.clone(),
+            aggs,
+        ));
+
+        // Map desired projection (interleaved Key/Agg) to HashAggregate
+        // output order (keys first, then aggs) via Project.
+        let mut agg_counter = 0usize;
+        let mut reorder: Vec<usize> = Vec::with_capacity(items.len());
+        for item in &items {
+            match item {
+                Item::Key(pos) => {
+                    reorder.push(key_idx.iter().position(|&i| i == *pos).unwrap());
+                }
+                Item::Agg(_) => {
+                    reorder.push(nkeys + agg_counter);
+                    agg_counter += 1;
                 }
             }
-            rows.push(out);
+        }
+        op = Box::new(Project::new(op, reorder));
+
+        let mut rows = Vec::with_capacity(32);
+        while let Some(r) = op.next()? {
+            rows.push(r);
         }
 
         Ok(ExecResult {
