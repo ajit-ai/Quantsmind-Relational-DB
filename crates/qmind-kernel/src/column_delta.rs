@@ -5,7 +5,7 @@
 //! OLAP queries to read from compact columnar storage without blocking
 //! OLTP writes to the row store.
 
-use crate::columnar::{ColumnSegmentBuilder, ColValue};
+use crate::columnar::{ColValue, ColumnSegmentBuilder};
 use crate::error::Result;
 use crate::wal::{Lsn, TxnId, WalRecord};
 use std::collections::HashMap;
@@ -112,13 +112,17 @@ impl DeltaBuffer {
             let col = &self.table.columns[col_idx];
             match col.col_type {
                 ColumnDataType::Int => {
-                    let vals: Vec<Option<i64>> = self.buffer.iter().map(|row| {
-                        row.get(col_idx).and_then(|v| match v {
-                            ColValue::Int(n) => Some(*n),
-                            ColValue::Null => None,
-                            _ => None,
+                    let vals: Vec<Option<i64>> = self
+                        .buffer
+                        .iter()
+                        .map(|row| {
+                            row.get(col_idx).and_then(|v| match v {
+                                ColValue::Int(n) => Some(*n),
+                                ColValue::Null => None,
+                                _ => None,
+                            })
                         })
-                    }).collect();
+                        .collect();
 
                     let unique_ints: std::collections::HashSet<i64> =
                         vals.iter().filter_map(|v| *v).collect();
@@ -129,13 +133,17 @@ impl DeltaBuffer {
                     }
                 }
                 ColumnDataType::Text => {
-                    let vals: Vec<Option<&str>> = self.buffer.iter().map(|row| {
-                        row.get(col_idx).and_then(|v| match v {
-                            ColValue::Text(s) => Some(s.as_str()),
-                            ColValue::Null => None,
-                            _ => None,
+                    let vals: Vec<Option<&str>> = self
+                        .buffer
+                        .iter()
+                        .map(|row| {
+                            row.get(col_idx).and_then(|v| match v {
+                                ColValue::Text(s) => Some(s.as_str()),
+                                ColValue::Null => None,
+                                _ => None,
+                            })
                         })
-                    }).collect();
+                        .collect();
 
                     let unique_texts: std::collections::HashSet<&str> =
                         vals.iter().filter_map(|v| *v).collect();
@@ -197,14 +205,11 @@ impl DeltaApplier {
             match record {
                 WalRecord::Put { txn, key, value } => {
                     if let Some(table_name) = extract_table_from_key(key) {
-                        pending_puts
-                            .entry(table_name)
-                            .or_default()
-                            .push(DeltaRow {
-                                txn: *txn,
-                                key: key.clone(),
-                                value: value.clone(),
-                            });
+                        pending_puts.entry(table_name).or_default().push(DeltaRow {
+                            txn: *txn,
+                            key: key.clone(),
+                            value: value.clone(),
+                        });
                     }
                 }
                 WalRecord::Commit { txn: _ } => {
@@ -291,7 +296,10 @@ fn decode_row_values(value: &[u8], schema: &TableSchema) -> Option<Vec<ColValue>
                     return None;
                 }
                 let len = u32::from_le_bytes([
-                    value[pos], value[pos + 1], value[pos + 2], value[pos + 3],
+                    value[pos],
+                    value[pos + 1],
+                    value[pos + 2],
+                    value[pos + 3],
                 ]) as usize;
                 pos += 4;
                 if len == 0 {
@@ -309,8 +317,14 @@ fn decode_row_values(value: &[u8], schema: &TableSchema) -> Option<Vec<ColValue>
                     return None;
                 }
                 let n = i64::from_le_bytes([
-                    value[pos], value[pos + 1], value[pos + 2], value[pos + 3],
-                    value[pos + 4], value[pos + 5], value[pos + 6], value[pos + 7],
+                    value[pos],
+                    value[pos + 1],
+                    value[pos + 2],
+                    value[pos + 3],
+                    value[pos + 4],
+                    value[pos + 5],
+                    value[pos + 6],
+                    value[pos + 7],
                 ]);
                 values.push(ColValue::Int(n));
                 pos += 8;
@@ -408,9 +422,18 @@ mod tests {
         TableSchema {
             table_name: "users".into(),
             columns: vec![
-                ColumnInfo { name: "id".into(), col_type: ColumnDataType::Int },
-                ColumnInfo { name: "name".into(), col_type: ColumnDataType::Text },
-                ColumnInfo { name: "dept".into(), col_type: ColumnDataType::Text },
+                ColumnInfo {
+                    name: "id".into(),
+                    col_type: ColumnDataType::Int,
+                },
+                ColumnInfo {
+                    name: "name".into(),
+                    col_type: ColumnDataType::Text,
+                },
+                ColumnInfo {
+                    name: "dept".into(),
+                    col_type: ColumnDataType::Text,
+                },
             ],
         }
     }
@@ -436,9 +459,18 @@ mod tests {
 
     #[test]
     fn extract_table_from_key_works() {
-        assert_eq!(extract_table_from_key(b"users:name:0"), Some("users".into()));
-        assert_eq!(extract_table_from_key(b"orders:total:5"), Some("orders".into()));
-        assert_eq!(extract_table_from_key(b"only_colon:"), Some("only_colon".into()));
+        assert_eq!(
+            extract_table_from_key(b"users:name:0"),
+            Some("users".into())
+        );
+        assert_eq!(
+            extract_table_from_key(b"orders:total:5"),
+            Some("orders".into())
+        );
+        assert_eq!(
+            extract_table_from_key(b"only_colon:"),
+            Some("only_colon".into())
+        );
         assert_eq!(extract_table_from_key(b"nodelim"), Some("nodelim".into()));
     }
 
@@ -447,11 +479,14 @@ mod tests {
         let schema = users_schema();
         let row = encode_row(&[encode_int(42), encode_text("alice"), encode_text("eng")]);
         let values = decode_row_values(&row, &schema).unwrap();
-        assert_eq!(values, vec![
-            ColValue::Int(42),
-            ColValue::Text("alice".into()),
-            ColValue::Text("eng".into()),
-        ]);
+        assert_eq!(
+            values,
+            vec![
+                ColValue::Int(42),
+                ColValue::Text("alice".into()),
+                ColValue::Text("eng".into()),
+            ]
+        );
     }
 
     #[test]
@@ -526,14 +561,16 @@ mod tests {
         // 3 rows triggers flush at threshold.
         for i in 0..3i64 {
             let dept = format!("d{i}");
-            let row_val = encode_row(&[encode_int(i), encode_text(&format!("u{i}")), encode_text(&dept)]);
-            let records = vec![
-                WalRecord::Put {
-                    txn: i as u64,
-                    key: b"users:id:0".to_vec(),
-                    value: row_val,
-                },
-            ];
+            let row_val = encode_row(&[
+                encode_int(i),
+                encode_text(&format!("u{i}")),
+                encode_text(&dept),
+            ]);
+            let records = vec![WalRecord::Put {
+                txn: i as u64,
+                key: b"users:id:0".to_vec(),
+                value: row_val,
+            }];
             applier.apply_wal_batch(&records).unwrap();
         }
 
@@ -576,11 +613,14 @@ mod tests {
         applier.register_table(users_schema());
 
         for i in 0..5i64 {
-            applier.append_row_to("users", vec![
-                ColValue::Int(i),
-                ColValue::Text(format!("u{i}")),
-                ColValue::Text("eng".into()),
-            ]);
+            applier.append_row_to(
+                "users",
+                vec![
+                    ColValue::Int(i),
+                    ColValue::Text(format!("u{i}")),
+                    ColValue::Text("eng".into()),
+                ],
+            );
         }
 
         let counts = applier.flush_all().unwrap();

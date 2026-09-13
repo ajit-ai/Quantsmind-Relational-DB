@@ -1,8 +1,8 @@
 //! Columnar reader — reads all segments for a table and produces rows.
 //! Used by the OLAP scan path (M8c).
 
-use crate::columnar::{open_column_segment, ColValue, ColumnSegment};
 use crate::column_delta::{list_segments, TableSchema};
+use crate::columnar::{open_column_segment, ColValue, ColumnSegment};
 use crate::error::Result;
 use std::path::Path;
 
@@ -110,9 +110,9 @@ impl ColumnarReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::columnar::ColumnSegmentBuilder;
-    use crate::column_delta::ColumnInfo;
     use crate::column_delta::ColumnDataType;
+    use crate::column_delta::ColumnInfo;
+    use crate::columnar::ColumnSegmentBuilder;
     use std::fs;
     use std::path::PathBuf;
 
@@ -127,8 +127,14 @@ mod tests {
         TableSchema {
             table_name: "t".into(),
             columns: vec![
-                ColumnInfo { name: "id".into(), col_type: ColumnDataType::Int },
-                ColumnInfo { name: "val".into(), col_type: ColumnDataType::Text },
+                ColumnInfo {
+                    name: "id".into(),
+                    col_type: ColumnDataType::Int,
+                },
+                ColumnInfo {
+                    name: "val".into(),
+                    col_type: ColumnDataType::Text,
+                },
             ],
         }
     }
@@ -140,7 +146,8 @@ mod tests {
         b.push_int_raw(&ids);
         b.push_text_raw(&vals);
         let seg_id = count_segs(dir);
-        b.write_to(dir.join(format!("col_{seg_id:06}.seg"))).unwrap();
+        b.write_to(dir.join(format!("col_{seg_id:06}.seg")))
+            .unwrap();
     }
 
     fn count_segs(dir: &Path) -> u64 {
@@ -187,9 +194,9 @@ mod tests {
         write_segment(&dir, &[(1, "a"), (2, "b"), (3, "c"), (4, "d")]);
 
         let reader = ColumnarReader::open(&dir, schema()).unwrap();
-        let rows = reader.read_filtered(|r| {
-            matches!(&r[0], ColValue::Int(n) if *n > 2)
-        }).unwrap();
+        let rows = reader
+            .read_filtered(|r| matches!(&r[0], ColValue::Int(n) if *n > 2))
+            .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], ColValue::Int(3));
         assert_eq!(rows[1][0], ColValue::Int(4));

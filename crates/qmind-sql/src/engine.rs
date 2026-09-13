@@ -12,9 +12,7 @@ use crate::codec::{decode_row, encode_row, row_key, ColumnDef, ColumnType, SqlVa
 use crate::executor::Row;
 use crate::executor::{Filter, HashAggregate, HashJoin, Limit, Operator, Project, VecScan};
 use crate::parser::{self, BinOp, DataType, Expr, SelectItem, Statement, TableRef};
-use qmind_kernel::column_delta::{
-    ColumnDataType, ColumnInfo, DeltaApplier, TableSchema,
-};
+use qmind_kernel::column_delta::{ColumnDataType, ColumnInfo, DeltaApplier, TableSchema};
 use qmind_kernel::column_reader::ColumnarReader;
 use qmind_kernel::columnar::ColValue;
 use qmind_kernel::{MvccStore, WalWriter};
@@ -92,13 +90,11 @@ impl<W: Write> Engine<W> {
         if let Some(ref dir) = self.columnar_dir {
             let table_dir = dir.join(table);
             if let Ok(entries) = std::fs::read_dir(&table_dir) {
-                return entries
-                    .filter_map(|e| e.ok())
-                    .any(|e| {
-                        let name = e.file_name();
-                        let name = name.to_string_lossy();
-                        name.starts_with("col_") && name.ends_with(".seg")
-                    });
+                return entries.filter_map(|e| e.ok()).any(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("col_") && name.ends_with(".seg")
+                });
             }
         }
         false
@@ -115,11 +111,7 @@ impl<W: Write> Engine<W> {
     }
 
     /// Read rows from columnar segments for a table.
-    fn read_columnar(
-        &self,
-        table: &str,
-        schema: &[ColumnDef],
-    ) -> Result<Vec<Row>, String> {
+    fn read_columnar(&self, table: &str, schema: &[ColumnDef]) -> Result<Vec<Row>, String> {
         let dir = self
             .columnar_dir
             .as_ref()
@@ -127,8 +119,7 @@ impl<W: Write> Engine<W> {
             .join(table);
 
         let table_schema = column_def_to_schema(table, schema);
-        let reader =
-            ColumnarReader::open(&dir, table_schema).map_err(|e| e.to_string())?;
+        let reader = ColumnarReader::open(&dir, table_schema).map_err(|e| e.to_string())?;
 
         let col_values = reader.read_all_rows().map_err(|e| e.to_string())?;
 

@@ -266,7 +266,9 @@ fn columnar_htap_insert_flush_select() {
     assert_eq!(r.rows[99][2], SqlValue::Int(990));
 
     // SELECT with WHERE.
-    let r = eng.execute("SELECT name, price FROM products WHERE id = 42").unwrap();
+    let r = eng
+        .execute("SELECT name, price FROM products WHERE id = 42")
+        .unwrap();
     assert_eq!(r.rows.len(), 1);
     assert_eq!(r.rows[0][0], SqlValue::Text("item_42".into()));
     assert_eq!(r.rows[0][1], SqlValue::Int(420));
@@ -289,7 +291,8 @@ fn columnar_htap_insert_flush_select() {
 fn columnar_htap_no_columnar_falls_back_to_mvcc() {
     let mut eng = Engine::new(Vec::new());
 
-    eng.execute("CREATE TABLE t (id INTEGER NOT NULL, val TEXT)").unwrap();
+    eng.execute("CREATE TABLE t (id INTEGER NOT NULL, val TEXT)")
+        .unwrap();
     eng.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
     eng.execute("INSERT INTO t VALUES (2, 'world')").unwrap();
 
@@ -307,17 +310,20 @@ fn columnar_htap_multiple_flushes_concatenate() {
 
     let mut eng = Engine::new(Vec::new()).with_columnar(dir.clone());
 
-    eng.execute("CREATE TABLE logs (ts INTEGER NOT NULL, msg TEXT)").unwrap();
+    eng.execute("CREATE TABLE logs (ts INTEGER NOT NULL, msg TEXT)")
+        .unwrap();
 
     // First batch: 3 rows.
     for i in 0..3i64 {
-        eng.execute(&format!("INSERT INTO logs VALUES ({i}, 'log_{i}')")).unwrap();
+        eng.execute(&format!("INSERT INTO logs VALUES ({i}, 'log_{i}')"))
+            .unwrap();
     }
     eng.flush_to_columnar().unwrap();
 
     // Second batch: 2 rows.
     for i in 3..5i64 {
-        eng.execute(&format!("INSERT INTO logs VALUES ({i}, 'log_{i}')")).unwrap();
+        eng.execute(&format!("INSERT INTO logs VALUES ({i}, 'log_{i}')"))
+            .unwrap();
     }
     eng.flush_to_columnar().unwrap();
 
