@@ -211,8 +211,14 @@ fn decode_raw(data: &[u8], meta: &ColumnMeta) -> Result<Vec<ColValue>> {
                     return Err(Error::Other("int data truncated".into()));
                 }
                 let val = i64::from_le_bytes([
-                    data[pos], data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4],
-                    data[pos + 5], data[pos + 6], data[pos + 7],
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
+                    data[pos + 5],
+                    data[pos + 6],
+                    data[pos + 7],
                 ]);
                 values.push(ColValue::Int(val));
                 pos += 8;
@@ -221,9 +227,9 @@ fn decode_raw(data: &[u8], meta: &ColumnMeta) -> Result<Vec<ColValue>> {
                 if pos + 4 > data.len() {
                     return Err(Error::Other("text length truncated".into()));
                 }
-                let len = u32::from_le_bytes([
-                    data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                ]) as usize;
+                let len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
                 if pos + len > data.len() {
                     return Err(Error::Other("text data truncated".into()));
@@ -256,9 +262,8 @@ fn decode_dict(data: &[u8], meta: &ColumnMeta) -> Result<Vec<ColValue>> {
         if pos + 4 > data.len() {
             return Err(Error::Other("dict entry length truncated".into()));
         }
-        let len = u32::from_le_bytes([
-            data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-        ]) as usize;
+        let len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
         if pos + len > data.len() {
             return Err(Error::Other("dict entry data truncated".into()));
@@ -275,9 +280,8 @@ fn decode_dict(data: &[u8], meta: &ColumnMeta) -> Result<Vec<ColValue>> {
         if pos + 4 > data.len() {
             return Err(Error::Other("dict index truncated".into()));
         }
-        let idx = u32::from_le_bytes([
-            data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-        ]) as usize;
+        let idx =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
         if idx == u32::MAX as usize {
             values.push(ColValue::Null);
@@ -300,12 +304,17 @@ fn decode_rle(data: &[u8], meta: &ColumnMeta) -> Result<Vec<ColValue>> {
         if pos + 8 > data.len() {
             return Err(Error::Other("rle run truncated".into()));
         }
-        let run_len = u32::from_le_bytes([
-            data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-        ]) as usize;
+        let run_len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         let val = i64::from_le_bytes([
-            data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7], data[pos + 8],
-            data[pos + 9], data[pos + 10], data[pos + 11],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
+            data[pos + 8],
+            data[pos + 9],
+            data[pos + 10],
+            data[pos + 11],
         ]);
         pos += 12;
         for _ in 0..run_len {
@@ -466,18 +475,16 @@ impl ColumnSegmentBuilder {
                         runs.push(run);
                     }
                 }
-                Some(n) => {
-                    match &mut current_run {
-                        Some((count, val)) if *val == *n => *count += 1,
-                        Some((count, val)) => {
-                            let old = (*count, *val);
-                            *count = 1;
-                            *val = *n;
-                            runs.push(old);
-                        }
-                        None => current_run = Some((1, *n)),
+                Some(n) => match &mut current_run {
+                    Some((count, val)) if *val == *n => *count += 1,
+                    Some((count, val)) => {
+                        let old = (*count, *val);
+                        *count = 1;
+                        *val = *n;
+                        runs.push(old);
                     }
-                }
+                    None => current_run = Some((1, *n)),
+                },
             }
         }
         if let Some(run) = current_run.take() {
@@ -575,12 +582,15 @@ mod tests {
         assert_eq!(seg.num_rows(), 4);
         assert_eq!(seg.num_columns(), 1);
         let decoded = seg.decode_column(0).unwrap();
-        assert_eq!(decoded, vec![
-            ColValue::Int(10),
-            ColValue::Int(20),
-            ColValue::Null,
-            ColValue::Int(40),
-        ]);
+        assert_eq!(
+            decoded,
+            vec![
+                ColValue::Int(10),
+                ColValue::Int(20),
+                ColValue::Null,
+                ColValue::Int(40),
+            ]
+        );
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -594,18 +604,27 @@ mod tests {
 
         let seg = ColumnSegment::open(&path).unwrap();
         let decoded = seg.decode_column(0).unwrap();
-        assert_eq!(decoded, vec![
-            ColValue::Text("hello".into()),
-            ColValue::Null,
-            ColValue::Text("world".into()),
-        ]);
+        assert_eq!(
+            decoded,
+            vec![
+                ColValue::Text("hello".into()),
+                ColValue::Null,
+                ColValue::Text("world".into()),
+            ]
+        );
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn text_dict_roundtrip() {
         let path = tmp_path("text_dict");
-        let vals: Vec<Option<&str>> = vec![Some("apple"), Some("banana"), Some("apple"), None, Some("banana")];
+        let vals: Vec<Option<&str>> = vec![
+            Some("apple"),
+            Some("banana"),
+            Some("apple"),
+            None,
+            Some("banana"),
+        ];
         let mut b = ColumnSegmentBuilder::new(1, 5);
         b.push_text_dict(&vals);
         b.write_to(&path).unwrap();
@@ -615,13 +634,16 @@ mod tests {
         assert_eq!(meta.encoding, Encoding::Dict);
         assert_eq!(meta.null_count, 1);
         let decoded = seg.decode_column(0).unwrap();
-        assert_eq!(decoded, vec![
-            ColValue::Text("apple".into()),
-            ColValue::Text("banana".into()),
-            ColValue::Text("apple".into()),
-            ColValue::Null,
-            ColValue::Text("banana".into()),
-        ]);
+        assert_eq!(
+            decoded,
+            vec![
+                ColValue::Text("apple".into()),
+                ColValue::Text("banana".into()),
+                ColValue::Text("apple".into()),
+                ColValue::Null,
+                ColValue::Text("banana".into()),
+            ]
+        );
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -637,11 +659,17 @@ mod tests {
         let meta = seg.column_meta(0).unwrap();
         assert_eq!(meta.encoding, Encoding::Rle);
         let decoded = seg.decode_column(0).unwrap();
-        assert_eq!(decoded, vec![
-            ColValue::Int(5), ColValue::Int(5), ColValue::Int(5),
-            ColValue::Int(7), ColValue::Int(7),
-            ColValue::Int(9),
-        ]);
+        assert_eq!(
+            decoded,
+            vec![
+                ColValue::Int(5),
+                ColValue::Int(5),
+                ColValue::Int(5),
+                ColValue::Int(7),
+                ColValue::Int(7),
+                ColValue::Int(9),
+            ]
+        );
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -660,15 +688,24 @@ mod tests {
         assert_eq!(seg.num_rows(), 4);
         let d0 = seg.decode_column(0).unwrap();
         let d1 = seg.decode_column(1).unwrap();
-        assert_eq!(d0, vec![
-            ColValue::Int(1), ColValue::Int(2), ColValue::Int(3), ColValue::Null,
-        ]);
-        assert_eq!(d1, vec![
-            ColValue::Text("alice".into()),
-            ColValue::Text("bob".into()),
-            ColValue::Text("carol".into()),
-            ColValue::Null,
-        ]);
+        assert_eq!(
+            d0,
+            vec![
+                ColValue::Int(1),
+                ColValue::Int(2),
+                ColValue::Int(3),
+                ColValue::Null,
+            ]
+        );
+        assert_eq!(
+            d1,
+            vec![
+                ColValue::Text("alice".into()),
+                ColValue::Text("bob".into()),
+                ColValue::Text("carol".into()),
+                ColValue::Null,
+            ]
+        );
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

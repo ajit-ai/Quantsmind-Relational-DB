@@ -17,10 +17,9 @@ mod fuzz {
         rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
 
         let keywords = [
-            "SELECT", "*", "FROM", "WHERE", "AND", "INSERT", "INTO", "VALUES",
-            "CREATE", "TABLE", "INTEGER", "TEXT", "NOT", "NULL", "LIMIT", "JOIN",
-            "INNER", "ON", "GROUP", "BY", "SHOW", "TABLES", "IF", "EXISTS",
-            "COUNT", "SUM", "AVG", "MIN", "MAX",
+            "SELECT", "*", "FROM", "WHERE", "AND", "INSERT", "INTO", "VALUES", "CREATE", "TABLE",
+            "INTEGER", "TEXT", "NOT", "NULL", "LIMIT", "JOIN", "INNER", "ON", "GROUP", "BY",
+            "SHOW", "TABLES", "IF", "EXISTS", "COUNT", "SUM", "AVG", "MIN", "MAX",
         ];
 
         for _ in 0..len {
@@ -100,10 +99,7 @@ mod fuzz {
             }
             let s = String::from_utf8_lossy(&input);
             let result = panic::catch_unwind(|| qmind_sql::parser::tokenize(&s));
-            assert!(
-                result.is_ok(),
-                "tokenizer panicked on seed {seed}: {s:?}"
-            );
+            assert!(result.is_ok(), "tokenizer panicked on seed {seed}: {s:?}");
         }
     }
 
@@ -125,10 +121,7 @@ mod fuzz {
         for sql in &bad {
             let result = Parser::parse(sql);
             if let Err(e) = result {
-                assert!(
-                    !e.is_empty(),
-                    "empty error message for {sql:?}"
-                );
+                assert!(!e.is_empty(), "empty error message for {sql:?}");
             }
         }
     }

@@ -5,14 +5,20 @@
 //! - INSERT INTO t VALUES (..), (..)
 //! - SELECT cols | * FROM t [INNER JOIN t ON col = col] [WHERE cond]
 //!   [GROUP BY col] [LIMIT n]
+//!
+//! M9: Columnar HTAP integration — reads from columnar segments when available.
 
 use crate::codec::{decode_row, encode_row, row_key, ColumnDef, ColumnType, SqlValue};
 use crate::executor::Row;
 use crate::executor::{Filter, HashAggregate, HashJoin, Limit, Operator, Project, VecScan};
 use crate::parser::{self, BinOp, DataType, Expr, SelectItem, Statement, TableRef};
+use qmind_kernel::column_delta::{ColumnDataType, ColumnInfo, DeltaApplier, TableSchema};
+use qmind_kernel::column_reader::ColumnarReader;
+use qmind_kernel::columnar::ColValue;
 use qmind_kernel::{MvccStore, WalWriter};
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub struct ExecResult {
@@ -38,6 +44,12 @@ pub struct Engine<W: Write> {
     wal: WalWriter<W>,
     tables: HashMap<String, Vec<ColumnDef>>,
     next_row_id: HashMap<String, u64>,
+    /// Optional columnar segment directory for HTAP OLAP reads.
+    columnar_dir: Option<PathBuf>,
+    /// Delta buffer accumulates rows for async columnar flush.
+    delta_applier: Option<DeltaApplier>,
+    /// Row count threshold before auto-flushing to columnar segments.
+    columnar_flush_threshold: usize,
 }
 
 impl<W: Write> Engine<W> {
@@ -47,7 +59,79 @@ impl<W: Write> Engine<W> {
             wal: WalWriter::new(wal_sink),
             tables: HashMap::new(),
             next_row_id: HashMap::new(),
+            columnar_dir: None,
+            delta_applier: None,
+            columnar_flush_threshold: 10_000,
         }
+    }
+
+    /// Enable columnar HTAP: set the directory for columnar segment files.
+    /// Rows inserted after this call will be captured for async columnar flush.
+    pub fn with_columnar(mut self, dir: PathBuf) -> Self {
+        std::fs::create_dir_all(&dir).ok();
+        let mut applier = DeltaApplier::new(dir.clone(), self.columnar_flush_threshold);
+        // Register schemas for existing tables.
+        for (name, cols) in &self.tables {
+            let schema = column_def_to_schema(name, cols);
+            applier.register_table(schema);
+        }
+        self.columnar_dir = Some(dir);
+        self.delta_applier = Some(applier);
+        self
+    }
+
+    /// Set the row count threshold before auto-flushing to columnar.
+    pub fn set_columnar_flush_threshold(&mut self, threshold: usize) {
+        self.columnar_flush_threshold = threshold;
+    }
+
+    /// Check if columnar data exists for a table.
+    pub fn has_columnar_data(&self, table: &str) -> bool {
+        if let Some(ref dir) = self.columnar_dir {
+            let table_dir = dir.join(table);
+            if let Ok(entries) = std::fs::read_dir(&table_dir) {
+                return entries.filter_map(|e| e.ok()).any(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("col_") && name.ends_with(".seg")
+                });
+            }
+        }
+        false
+    }
+
+    /// Flush pending delta rows to columnar segments.
+    /// Returns table_name → rows_flushed.
+    pub fn flush_to_columnar(&mut self) -> Result<HashMap<String, usize>, String> {
+        if let Some(ref mut applier) = self.delta_applier {
+            applier.flush_all().map_err(|e| e.to_string())
+        } else {
+            Ok(HashMap::new())
+        }
+    }
+
+    /// Read rows from columnar segments for a table.
+    fn read_columnar(&self, table: &str, schema: &[ColumnDef]) -> Result<Vec<Row>, String> {
+        let dir = self
+            .columnar_dir
+            .as_ref()
+            .ok_or("columnar not enabled")?
+            .join(table);
+
+        let table_schema = column_def_to_schema(table, schema);
+        let reader = ColumnarReader::open(&dir, table_schema).map_err(|e| e.to_string())?;
+
+        let col_values = reader.read_all_rows().map_err(|e| e.to_string())?;
+
+        // Convert ColValue → SqlValue for each row.
+        Ok(col_values
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|cv| col_value_to_sql_value(&cv))
+                    .collect()
+            })
+            .collect())
     }
 
     /// Parse + execute a single statement.
@@ -103,8 +187,13 @@ impl<W: Write> Engine<W> {
                 nullable: !col.not_null,
             });
         }
-        self.tables.insert(name.to_string(), cols);
+        self.tables.insert(name.to_string(), cols.clone());
         self.next_row_id.entry(name.to_string()).or_insert(0);
+        // M9: Register table schema for columnar delta capture.
+        if let Some(ref mut applier) = self.delta_applier {
+            let schema = column_def_to_schema(name, &cols);
+            applier.register_table(schema);
+        }
         Ok(ExecResult::empty())
     }
 
@@ -140,6 +229,11 @@ impl<W: Write> Engine<W> {
             }
             let rid = start_id + count;
             self.db.set(txn, &row_key(table, rid), encode_row(&row));
+            // M9: Capture row for columnar delta buffer.
+            if let Some(ref mut applier) = self.delta_applier {
+                let col_values: Vec<ColValue> = row.iter().map(sql_value_to_col_value).collect();
+                applier.append_row_to(table, col_values);
+            }
             count += 1;
         }
         *self.next_row_id.get_mut(table).unwrap() += count;
@@ -177,6 +271,11 @@ impl<W: Write> Engine<W> {
             .get(&table)
             .cloned()
             .ok_or_else(|| format!("no table `{table}`"))?;
+
+        // M9: Columnar OLAP path — read from columnar segments if available.
+        if self.has_columnar_data(&table) {
+            return self.select_from_columnar(sel, &schema, &table);
+        }
 
         // GROUP BY path.
         if !sel.group_by.is_empty() {
@@ -264,6 +363,66 @@ impl<W: Write> Engine<W> {
         };
         if max_rows > 0 {
             op = Box::new(Limit::new(op, max_rows));
+        }
+
+        let mut rows = Vec::new();
+        while let Some(r) = op.next()? {
+            rows.push(r);
+        }
+
+        Ok(ExecResult {
+            columns: out_cols,
+            rows,
+            rows_affected: 0,
+        })
+    }
+
+    /// M9: Read from columnar segments and apply projection/filter/limit.
+    fn select_from_columnar(
+        &self,
+        sel: &parser::Select,
+        schema: &[ColumnDef],
+        table: &str,
+    ) -> Result<ExecResult, String> {
+        // Read all rows from columnar.
+        let raw_rows = self.read_columnar(table, schema)?;
+
+        // Determine output columns.
+        let (proj_indices, out_cols) =
+            if sel.projection.len() == 1 && matches!(sel.projection[0], SelectItem::Star) {
+                (
+                    None,
+                    schema.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                )
+            } else {
+                let mut idx = Vec::new();
+                let mut names = Vec::new();
+                for item in &sel.projection {
+                    let SelectItem::Expr(Expr::Identifier(id)) = item else {
+                        return Err("only plain column projections supported".into());
+                    };
+                    let pos = schema
+                        .iter()
+                        .position(|c| c.name == id.as_str())
+                        .ok_or_else(|| format!("unknown column {id}"))?;
+                    idx.push(pos);
+                    names.push(id.clone());
+                }
+                (Some(idx), names)
+            };
+
+        // Apply filter + project via Volcano pipeline.
+        let mut op: Box<dyn Operator> = Box::new(VecScan::new(raw_rows));
+        if let Some(pred) = &sel.selection {
+            let s = schema.to_vec();
+            let p: Expr = pred.clone();
+            op = Box::new(Filter::new(op, move |r: &Row| eval_predicate(&p, &s, r)));
+        }
+        if let Some(indices) = &proj_indices {
+            op = Box::new(Project::new(op, indices.clone()));
+        }
+        if let Some(limit) = sel.limit {
+            op = Box::new(Limit::new(op, limit));
         }
 
         let mut rows = Vec::new();
@@ -742,4 +901,41 @@ fn try_parse_aggregates(
         out.push(Aggregate { label, func, col });
     }
     Ok(Some(out))
+}
+
+// ── Columnar integration helpers (M9) ─────────────────────────────────────
+
+/// Convert engine SqlValue to columnar ColValue.
+fn sql_value_to_col_value(sv: &SqlValue) -> ColValue {
+    match sv {
+        SqlValue::Null => ColValue::Null,
+        SqlValue::Int(n) => ColValue::Int(*n),
+        SqlValue::Text(s) => ColValue::Text(s.clone()),
+    }
+}
+
+/// Convert engine ColumnDef slice to column_delta TableSchema.
+fn column_def_to_schema(table_name: &str, cols: &[ColumnDef]) -> TableSchema {
+    TableSchema {
+        table_name: table_name.to_string(),
+        columns: cols
+            .iter()
+            .map(|c| ColumnInfo {
+                name: c.name.clone(),
+                col_type: match c.ty {
+                    ColumnType::Int => ColumnDataType::Int,
+                    ColumnType::Text => ColumnDataType::Text,
+                },
+            })
+            .collect(),
+    }
+}
+
+/// Convert columnar ColValue back to engine SqlValue.
+fn col_value_to_sql_value(cv: &ColValue) -> SqlValue {
+    match cv {
+        ColValue::Null => SqlValue::Null,
+        ColValue::Int(n) => SqlValue::Int(*n),
+        ColValue::Text(s) => SqlValue::Text(s.clone()),
+    }
 }

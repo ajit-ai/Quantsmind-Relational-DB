@@ -58,18 +58,27 @@ fn soak_10k_insert_select_group_join() {
     assert_eq!(r.rows[0][0], SqlValue::Int(10000));
 
     // Phase 3: SELECT WHERE filters — verify no phantom rows.
-    let r = eng.execute("SELECT COUNT(*) FROM users WHERE dept = 'dept0'").unwrap();
+    let r = eng
+        .execute("SELECT COUNT(*) FROM users WHERE dept = 'dept0'")
+        .unwrap();
     let dept0_count = match &r.rows[0][0] {
         SqlValue::Int(n) => *n,
         _ => panic!("expected int"),
     };
-    assert_eq!(dept0_count, 2000, "each dept should have exactly 2000 users");
+    assert_eq!(
+        dept0_count, 2000,
+        "each dept should have exactly 2000 users"
+    );
 
     // Phase 4: JOIN — verify row count matches.
     let r = eng
         .execute("SELECT name, amount FROM users INNER JOIN orders ON id = uid")
         .unwrap();
-    assert_eq!(r.rows.len(), 10000, "joined rows should be 10K (one per user)");
+    assert_eq!(
+        r.rows.len(),
+        10000,
+        "joined rows should be 10K (one per user)"
+    );
     let mut total_amount = 0i64;
     for row in &r.rows {
         match &row[1] {
@@ -109,11 +118,8 @@ fn soak_10k_insert_select_group_join() {
     for i in 0..5000u64 {
         eng.execute(&format!("INSERT INTO logs VALUES ({i}, 'log{i}')"))
             .unwrap();
-        eng.execute(&format!(
-            "INSERT INTO tags VALUES ({i}, 'tag{}')",
-            i % 10
-        ))
-        .unwrap();
+        eng.execute(&format!("INSERT INTO tags VALUES ({i}, 'tag{}')", i % 10))
+            .unwrap();
     }
 
     let r = eng.execute("SELECT COUNT(*) FROM logs").unwrap();
@@ -149,7 +155,11 @@ fn soak_10k_insert_select_group_join() {
     eng.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER)")
         .unwrap();
     let r = eng.execute("SELECT COUNT(*) FROM users").unwrap();
-    assert_eq!(r.rows[0][0], SqlValue::Int(10000), "IF NOT EXISTS must not truncate");
+    assert_eq!(
+        r.rows[0][0],
+        SqlValue::Int(10000),
+        "IF NOT EXISTS must not truncate"
+    );
 
     // Final: SHOW TABLES lists all 5 tables.
     let r = eng.execute("SHOW TABLES").unwrap();
