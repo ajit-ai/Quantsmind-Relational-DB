@@ -1,8 +1,10 @@
 # QuantsMind Relational Database Engine
 
-A production-grade, embeddable relational database engine written in Rust, designed for hybrid transactional + analytical workloads (HTAP). Ships as a library, a Postgres-wire-compatible server, a CLI shell, and a native desktop GUI studio.
+> **Status: Developer Preview / Experimental** — feature-complete for its SQL subset; not yet production-hardened (see [Architecture](docs/ARCHITECTURE.md) for honest gaps).
 
-**Version 0.1.0** · [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md)
+An embeddable relational database engine written in Rust, designed for hybrid transactional + analytical workloads (HTAP). Ships as a library, a Postgres-wire-compatible server, a CLI shell, and a native desktop GUI studio.
+
+**Version 0.1.0** · MIT License · [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md)
 
 ---
 
@@ -30,7 +32,7 @@ A production-grade, embeddable relational database engine written in Rust, desig
 ## Design Pillars
 
 1. **Kernel-first layering** — the core is a generic KV + index + MVCC + WAL storage kernel. Relational, Document, and Key-Value are model layers on top. New data models are additive features, not rewrites.
-2. **HTAP from day one** — row store serves OLTP; vectorized columnar-batch executor serves OLAP over the same data. Persistent columnar replica planned for M8.
+2. **HTAP from day one** — row store serves OLTP; a persistent columnar replica (M8) serves OLAP reads. The OLAP path is batched, not yet SIMD-vectorized.
 3. **Performance is a contract** — every milestone has numeric exit criteria enforced by benchmarks in CI. No aspirational numbers.
 4. **Correctness over speed** — MVCC and recovery are fuzzed and property-tested. Silent corruption is the only unacceptable bug.
 
@@ -47,10 +49,10 @@ A production-grade, embeddable relational database engine written in Rust, desig
 │    Postgres wire protocol v3 · TCP listener · session pool         │
 ├───────────────────────────────────────────────────────────────────┤
 │  SQL Layer                      [qmind-sql]                        │
-│    Parser (sqlparser-rs) → Volcano operator executor               │
+│    Handwritten parser → Volcano operator executor                  │
 │    DDL: CREATE TABLE · DML: INSERT / SELECT                        │
 │    Operators: SeqScan · Filter · Project · Limit                   │
-│              HashJoin · HashAggregate                              │
+│              HashJoin · HashAggregate · Columnar read path (M9)    │
 ├───────────────────────────────────────────────────────────────────┤
 │  Embedded API                [qmind-embed]                         │
 │    JSON contract for GUI / host integration                        │
@@ -533,15 +535,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 | Suite | Count | Scope |
 |---|---|---|
-| Kernel unit | 41 | Buffer pool, B+Tree, WAL, MVCC, locks, recovery, eviction, file store |
-| SQL engine | 10 | DDL, DML, WHERE, LIMIT, JOIN, GROUP BY, aggregates |
-| SQL parser | 17 | Tokenizer, AST, case-insensitive, strings, expressions |
-| Volcano operators | 10 | SeqScan, Filter, Project, Limit, HashJoin, HashAggregate |
+| Kernel unit | 61 | Pages, buffer pool, B+Tree, WAL, MVCC, locks, recovery, eviction, file store, columnar (M8) |
+| SQL e2e | 13 | DDL, DML, WHERE, LIMIT, JOIN, GROUP BY, aggregates, columnar HTAP (M9) |
+| SQL parser | 23 | Tokenizer, AST, case-insensitivity, strings, expressions |
 | Parser fuzz | 4 | 8K random inputs, no panics |
-| Soak test | 1 | 10K row lifecycle across 5 tables |
-| Wire protocol | 1 | TCP e2e (multi-client, shared engine) |
+| Soak test | 1 | 10K row lifecycle across multiple tables |
+| Wire protocol | 3 | TCP e2e (multi-client, shared engine) |
 | Embedded API | 2 | JSON API contract |
-| **Total** | **85** | **All green, clippy clean** |
+| Kernel integration | 1 | Cross-store roundtrip |
+| **Total** | **108** | **All green, clippy clean** |
 
 ---
 
@@ -550,7 +552,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | Layer | Technology |
 |---|---|
 | Language | Rust 2021 (MSRV 1.75) |
-| Parser | sqlparser-rs 0.50 |
+| Parser | Handwritten tokenizer + recursive descent (0 external parser deps) |
 | Serialization | serde_json 1.x |
 | Desktop | Tauri 2 (Rust + React/TypeScript) |
 | Frontend | React 18, Vite 5, Tailwind CSS |
@@ -564,7 +566,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 | ID | Decision | Rationale |
 |---|---|---|
-| D-001 | **HTAP** — row store for OLTP, vectorized executor for OLAP, persistent columnar replica later | Hybrid workload without data duplication |
+| D-001 | **HTAP** — row store for OLTP; persistent columnar replica (M8) for OLAP reads | Hybrid workload without data duplication |
 | D-002 | **Layered kernel** — KV + index + MVCC + WAL core; relational/doc/KV model layers on top | Extensibility without rewrites |
 | D-003 | **Versioned on-disk format** — magic bytes + format version in every file header | Forward migration, no silent corruption |
 | D-004 | **Postgres wire protocol** — ecosystem leverage (psql, DBeaver, drivers) | Zero-friction adoption |
@@ -576,23 +578,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 | Phase | Theme | Status |
 |---|---|---|
 | M0 | Foundations (workspace, CI, docs) | Done |
-| M1 | Storage kernel (pages, B+Tree, WAL) | Done |
+| M1 | Storage kernel (pages, B+Tree, WAL, file store) | Done |
 | M2 | Transactions (MVCC, ARIES recovery) | Done |
 | M3 | SQL core (DDL, DML, filter, limit) | Done |
 | M4 | Relational (JOIN, GROUP BY, aggregates) | Done |
-| M5 | Server + CLI shell | Done |
-| M6 | Desktop Studio (Tauri 2) | In progress |
-| E1 | LRU-K eviction | Done |
-| E2 | ARIES recovery (Analysis/Redo/Undo) | Done |
-| E3 | Strict 2PL lock manager + deadlock detection | Done |
-| E4 | Volcano executor framework | Done |
-| E4b | Engine rewired onto Volcano operators | In progress |
-| E5 | Handwritten parser (tokenizer + recursive descent) | Pending |
-| M7 | Hardening (fuzzing, soak, packaging) | Pending |
-| M8 | Persistent columnar replica (full HTAP) | Pending |
+| M5 | Server + CLI shell | Done (trust auth; SCRAM/TLS pending) |
+| M6 | Desktop Studio (Tauri 2) | Shell done (rich UI rewiring pending) |
+| M7 | Hardening (fuzzing, soak, packaging, v0.1.0) | Done |
+| M8 | Persistent columnar replica (full HTAP) | Done |
+| M9 | Columnar integration into SQL engine | Done |
+| P2–P12 | Production arc (correctness, concurrency, perf, ops, 1.0 GA) | Planned — see [ROADMAP](docs/ROADMAP.md) |
 
 ---
 
 ## License
 
-QuantsMind Relational Database Engine is open source software.
+QuantsMind Relational Database Engine is licensed under the [MIT License](LICENSE).

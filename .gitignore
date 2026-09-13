@@ -28,3 +28,6 @@ dist-ssr
 
 # Tauri/Rust build artifacts (desktop shell)
 src-tauri/target
+
+# Bolt tool artifacts (bolt.new template config)
+.bolt/

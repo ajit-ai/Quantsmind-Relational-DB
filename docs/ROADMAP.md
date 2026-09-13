@@ -1,66 +1,106 @@
 # QuantsMind Engine — Roadmap
 
-> Each milestone ships an independently usable artifact. Exit criteria are
-> enforced by benchmarks/tests in CI. See [ARCHITECTURE.md](./ARCHITECTURE.md).
+> Status: **v0.1 Developer Preview (Experimental)** · updated 2026-09
+> Exit criteria are enforced by tests/benches in CI. Companion: [ARCHITECTURE.md](./ARCHITECTURE.md).
+> Honest status language used throughout: ✅ done / 🟡 partial / ⬜ planned.
 
-| Milestone | Theme | Status | Exit criteria |
+## Milestone status (accurate as of 2026-09)
+
+| Milestone | Theme | Status |
+|---|---|---|
+| **M0** | Foundations: workspace, CI, docs, bench harness | ✅ done |
+| **M1** | Storage kernel: pages, buffer pool, B+Tree, WAL (group commit), file store | ✅ done |
+| **M2** | Transactions: MVCC snapshots, recovery replay | ✅ done |
+| **M3** | SQL core: parse → DDL/DML → filter/limit over MVCC | ✅ done |
+| **M4** | Relational: GROUP BY, aggregates, hash INNER JOIN | ✅ done (secondary indexes remaining) |
+| **M5** | PG wire server + CLI shell (trust auth, simple Query) | 🟡 core done — auth/extended protocol pending |
+| **M6** | Desktop Studio GUI (Tauri 2) | 🟡 shell done — rich UI not yet rewired to Rust engine |
+| **M7** | Production hardening: fuzzing, soak, perf valley, packaging, v0.1.0 | ✅ done |
+| **M8** | Persistent columnar replica (full HTAP storage split) | ✅ done |
+| **M9** | Columnar integration into SQL engine (delta capture + routed reads) | ✅ done |
+
+## Current state
+
+- 108 tests green (61 kernel + 23 parser + 13 e2e + 4 fuzz + 1 soak + 3 wire + 2 embed + 1 integration).
+- `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` all green on CI (Ubuntu + Windows).
+- Performance measured: B+Tree insert 3.56M elem/s, WAL 2.5M rec/s (release).
+- **Status: Developer Preview / Experimental.** Honest gaps in ARCHITECTURE.md §1.1, §4, §5, §6.
+
+## Known limitations (documented, not bugs)
+
+- SQL subset: no PRIMARY KEY modifier, no INSERT column-lists, no ORDER BY,
+  no subqueries, no UPDATE/DELETE, no expressions beyond simple predicates.
+- JOIN projections are plain columns only (no aggregates over joins, no JOIN+GROUP BY).
+- Single-writer engine mutex; no mult-writer concurrency.
+- Server: trust auth only, no TLS, simple Query only.
+- GUI: rich components still bound to a PGlite prototype, not the Rust engine.
+
+## Next phases (toward production-grade)
+
+| Phase | Objective | Track | Exit criteria |
 |---|---|---|---|
-| **M0** | Foundations: workspace, CI, docs, bench harness | ✅ done | `cargo test` + clippy green in CI; workspace builds on Win/Linux |
-| **M1** | Storage kernel: pages, buffer pool, B+Tree, WAL (group commit) | ✅ done — file-backed store included | 2.49M inserts/s (contract ≥500K); full-page CRC; restart roundtrip tests |
-| **M2** | Transactions: MVCC snapshots, recovery replay | ✅ core done | FCW + SI tested; WAL-integrated commit; committed-state reconstruction from log |
-| **M3** | SQL core: parse → DDL/DML → filter/limit over MVCC | ✅ core done | 6 e2e SQL tests green; vectorized executor + sqllogictest remain (perf phase) |
-| **M4** | Relational: GROUP BY, aggregates, hash INNER JOIN | ✅ core done | e2e join+grouping tests; secondary indexes + TPC-H bench remain |
-| **M5** | PG wire server + CLI shell | 🔄 a done — b pending | TCP e2e test passes (2 clients, shared engine); scram auth + extended protocol + soak remain |
-| **M6** | Desktop Studio GUI (Tauri 2) | 🔄 a scaffold done | src-tauri shell + run_sql command + typed TS bridge; UI wiring, icons, installers remain |
-| **M7** | Production hardening: fuzzing, perf valley, packaging | ⬜ | 72h soak clean; all §1.1 performance contract targets met |
-| **M8** | Persistent columnar replica (full HTAP storage split) | ⬜ | delta-apply lag bounded; OLAP scans read replica without blocking OLTP |
+| **P2** | Docs truth reset + license + branding | Product | repo claims match reality; LICENSE present; honest status |
+| **P3** | Correctness hardening | Core | property/fuzz for B+Tree, MVCC, WAL; kill-9 chaos; zero committed-txn loss |
+| **P4** | Query surface | Core | secondary indexes, ORDER BY/sort, expression engine, richer predicates |
+| **P5** | Concurrency | Core | snapshot reads lock-free; multi-writer groundwork; read stress tests |
+| **P6** | Server hardening | Product | SCRAM auth, TLS, extended protocol; psql/DBeaver compat tests |
+| **P7** | HTAP perf contract | Perf | vectorized scans ≥50M rows/s; TPC-H Q1/Q6 ≤5× DuckDB; 72h soak |
+| **P8** | Operational product | Ops | logging/metrics; CSV/JSONL import-export; backup/restore; resource limits |
+| **P9** | Format & migration | Ops | versioned on-disk upgrade path; documented compatibility policy |
+| **P10** | Developer Preview v0.2 | Product | everything above packaged and documented; honest preview label |
+| **P11** | Production hardening | Product | conformance suite; security audit; semver/deprecation policy; signed releases |
+| **P12** | 1.0 GA | Product | sustained evidence: 72h soak on CI, perf contracts enforced, upgrade path, docs complete |
 
-## Milestone details
+## Multi-model outlook (post-1.0, additive per D-002)
 
-### M0 — Foundations (complete)
-- [x] Cargo workspace with 4 crates (`kernel`, `sql`, `server`, `cli`)
-- [x] Architecture doc + roadmap (this file)
-- [x] CI gates: fmt, clippy `-D warnings`, test, bench compile
-- [x] Criterion harness wired in kernel
-- [x] Kernel module skeletons with real type signatures (`page`, `buffer`, `btree`, `wal`, `mvcc`)
+- **Document model**: JSONB semantics as a model layer over the same kernel
+  (reuses B+Tree/MVCC/WAL/columnar). ~2 phases after relational 1.0.
+- **Key-Value model**: public KV API over the kernel. ~1–2 phases.
+- No rewrite expected: the layered kernel is the extension mechanism.
 
-### M1 — Storage kernel (core complete)
-- [x] Versioned CRC page headers (D-003), 8KiB pages
-- [x] Clock-sweep buffer pool with write-back eviction, validate-on-load
-- [x] B+Tree: insert/get/get_all/range-scan, run-preserving splits,
-      duplicate `(key,value)` ordering, differential test vs BTreeMap
-- [x] WAL: CRC frames, group commit (one syscall per group),
-      torn-tail-safe replay, committed-prefix crash semantics
-- [x] Benchmarks: 2.49M inserts/s · 6.1M WAL rec/s · 123ns page seal
-- [ ] File-backed PageStore with segment directory layout
-- [ ] Latch crabbing groundwork for concurrent descent (M2 bridge)
+## Milestone details (completed work, for the record)
 
-### M2 — Transactions & recovery
-Snapshot isolation, first-committer-wins validation, checkpointing, redo/undo
-replay. Crash-injection test harness (SIGKILL at random instruction points).
+### M0 — Foundations ✅
+Workspace (4 crates + `src-tauri` excluded), architecture + roadmap docs,
+CI gates (fmt, clippy `-D warnings`, test, bench-compile), criterion harness.
 
-### M3 — SQL core
-sqlparser-rs AST → logical IR → rule rewrites → push-based vectorized executor.
-OLTP point-plan fast path. sqllogictest files under `crates/qmind-sql/tests/`.
+### M1 — Storage kernel ✅
+Versioned CRC pages (8 KiB), clock-sweep buffer pool with write-back eviction,
+B+Tree (insert/get/get_all/range-scan, duplicates, differential test), WAL
+(CRC frames, group commit, torn-tail replay), file-backed page store.
+B+Tree insert 3.56M elem/s · WAL 2.5M rec/s.
 
-### M4 — Full relational
-Hash join / sort-merge join, hash/streams aggregates, secondary index maintenance,
-planner threshold routing (OLTP path vs vectorized path).
+### M2 — Transactions & recovery ✅
+Snapshot isolation, first-committer-wins, lock table, checkpoint + redo/undo
+replay, restart round-trip tests.
 
-### M5 — Server + CLI
-tokio listener, scram-sha-256 auth, simple + extended query protocol. CLI REPL.
+### M3 — SQL core ✅
+Handwritten tokenizer + recursive-descent parser (superseded the sqlparser-rs
+plan — see ARCHITECTURE §4), DDL/DML/SELECT over MVCC, filter/project/limit.
 
-### M6 — Desktop Studio
-Tauri 2 shell embedding the engine as a library; React UI evolved from this
-repo's existing prototype (SQL editor, schema browser, data grid patterns).
+### M4 — Relational ✅
+GROUP BY + aggregates (COUNT/SUM/AVG/MIN/MAX), hash INNER JOIN. Remaining:
+secondary indexes, JOIN+GROUP BY support.
 
-### M7 — Hardening
-cargo-fuzz targets, nightly perf runs vs contract table (§1.1), release
-packaging, docs site.
+### M5 — Server + CLI 🟡
+PG wire v3 simple Query over blocking threads (trust auth, TEXT values);
+minimal psql-like CLI REPL. Remaining: SCRAM/TLS, extended protocol.
 
-### M8 — Columnar replica
-Async delta apply from row store to persistent columnar segments.
+### M6 — Desktop Studio 🟡
+Tauri 2 shell with `run_sql` command over an embedded engine; minimal
+QmindStudio eval shell wiring. Remaining: rewire the rich React UI from the
+PGlite prototype to the Rust engine; icons/installers polish.
 
-## Post-M8 candidates (market-driven)
-Document model layer (JSONB semantics over kernel), KV model layer public API,
-SSI isolation, compression (columnar dictionary/RLE), backup/export tooling.
+### M7 — Hardening + release ✅
+Parser fuzz harness (8K inputs), 10K-row soak test, criterion benches,
+cross-platform installers (linux/macos/windows/freebsd + brew + scoop),
+SHA256SUMS on tag release, v0.1.0.
+
+### M8 — Columnar replica ✅
+QMINDCOL persistent segments (magic+version+CRC), Raw/Dict/RLE encodings,
+delta buffer + schema-aware DeltaApplier with LSN markers, ColumnarReader
+(all/filtered/projected scans).
+
+### M9 — Columnar engine integration ✅
+`Engine::with_columnar()`, insert capture to delta, threshold-based flush,
+columnar read routing when columnar data exists, 3 new e2e tests.
