@@ -21,7 +21,7 @@
 
 ## Current state
 
-- 108 tests green (61 kernel + 23 parser + 13 e2e + 4 fuzz + 1 soak + 3 wire + 2 embed + 1 integration).
+- 115 tests green (62 kernel + 6 kernel property + 23 parser + 13 e2e + 4 fuzz + 1 soak + 3 wire + 2 embed + 1 integration).
 - `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` all green on CI (Ubuntu + Windows).
 - Performance measured: B+Tree insert 3.56M elem/s, WAL 2.5M rec/s (release).
 - **Status: Developer Preview / Experimental.** Honest gaps in ARCHITECTURE.md §1.1, §4, §5, §6.
@@ -39,8 +39,8 @@
 
 | Phase | Objective | Track | Exit criteria |
 |---|---|---|---|
-| **P2** | Docs truth reset + license + branding | Product | repo claims match reality; LICENSE present; honest status |
-| **P3** | Correctness hardening | Core | property/fuzz for B+Tree, MVCC, WAL; kill-9 chaos; zero committed-txn loss |
+| **P2** | Docs truth reset + license + branding | Product | repo claims match reality; LICENSE present; honest status | ✅ |
+| **P3** | Correctness hardening | Core | property/fuzz for B+Tree, MVCC, WAL; kill-9 chaos; zero committed-txn loss | ✅ |
 | **P4** | Query surface | Core | secondary indexes, ORDER BY/sort, expression engine, richer predicates |
 | **P5** | Concurrency | Core | snapshot reads lock-free; multi-writer groundwork; read stress tests |
 | **P6** | Server hardening | Product | SCRAM auth, TLS, extended protocol; psql/DBeaver compat tests |
@@ -104,3 +104,36 @@ delta buffer + schema-aware DeltaApplier with LSN markers, ColumnarReader
 ### M9 — Columnar engine integration ✅
 `Engine::with_columnar()`, insert capture to delta, threshold-based flush,
 columnar read routing when columnar data exists, 3 new e2e tests.
+
+## Phase notes (recent completed work)
+
+### P2 — Docs truth reset + license + branding ✅
+MIT LICENSE added (workspace + per-crate), README/ARCHITECTURE/ROADMAP rewritten
+with honest status, test counts and feature claims corrected, studio package
+renamed/versioned (`quantsmind-studio` 0.1.0).
+
+### P3 — Correctness hardening ✅
+Deterministic property harness `crates/qmind-kernel/tests/correctness.rs`
+(zero external deps, splitmix64-seeded so every run is reproducible):
+- **B+Tree differential**: 4K random upserts against an in-memory oracle —
+  full-order scan, `get_all`, `len`, lower-bounded scans all agree.
+- **WAL committed-prefix**: exhaustive truncation at *every* byte of a
+  multi-group log — replay recovers exactly the frames fully contained, with
+  `torn_tail` reported consistently at frame boundaries vs mid-frame tears.
+- **WAL corruption**: 400 single-byte flips (plus multi-flip path) — every
+  corruption is detected (torn tail or `WalCorrupt`), never a phantom record.
+- **MVCC serial history**: 1200 interleaved beginning/commit/abort steps with
+  overlapping writers, first-committer-wins cross-checked against a watermark
+  model, plus a long-lived reader that must keep its frozen snapshot view.
+- **Zero committed-txn loss**: 300 MVCC commits through the WAL, recovered
+  state compared at every group durability point + 250 random tears — redo
+  state equals the surviving committed writers, and a torn group can never
+  report its txn as committed.
+
+Found and fixed a real kernel bug: splitting a leaf that had filled with a
+single duplicate key panicked (index out of bounds) and the raw-cut fallback
+would have silently broken `get_all`. The split now lets such a leaf overfill
+instead; a new unit regression test pins the behavior.
+
+`cargo test --workspace` green (115), `cargo fmt --check` and
+`cargo clippy -D warnings` green.

@@ -155,12 +155,20 @@ impl BTree {
         }
         let mut mid = leaf.entries.len() / 2;
         // Never cut through a duplicate run: advance to the boundary after
-        // the run containing `mid`. Right-routing depends on whole runs being
-        // owned by the right sibling. (A single key filling an entire leaf
-        // degenerates to a raw cut; get_all's chain-walk covers that case.)
+        // the run containing `mid`. Right-routing (equal keys descend to the
+        // right of the separator) depends on whole runs being owned by the
+        // right sibling.
         while mid < leaf.entries.len() && mid > 0 && leaf.entries[mid - 1].0 == leaf.entries[mid].0
         {
             mid += 1;
+        }
+        if mid == leaf.entries.len() {
+            // The whole leaf is one duplicate run. A raw cut here would park
+            // the run's left half behind the separator, where equal-keys-right
+            // routing makes it unreachable from `get_all`. Let the leaf
+            // overfill instead: the run stays contiguous, `get_all`'s chain
+            // walk keeps every copy visible, and ordering is undisturbed.
+            return None;
         }
         let sep = leaf.entries[mid].0.clone();
         let right = Leaf {
@@ -412,5 +420,47 @@ mod tests {
             .map(|(k, _)| u64::from_be_bytes(k[..8].try_into().unwrap()))
             .collect();
         assert_eq!(got, (990..1000).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn single_key_filling_a_leaf_splits_into_no_unreachable_run() {
+        // Regression: > LEAF_MAX copies of one key used to drive the leaf-split
+        // cursor past the end (panic) or strand the run's left half behind the
+        // separator, where equal-keys-right routing hides it from get_all.
+        let mut t = BTree::new();
+        // 5x LEAF_MAX identical (key, value) pairs plus surrounding keys.
+        let fill = (LEAF_MAX * 5) as u64;
+        for i in 0..=fill {
+            t.insert(b"k", i);
+            if i % LEAF_MAX as u64 == 0 {
+                t.insert(&key(i), i);
+            }
+        }
+        assert_eq!(t.get_all(b"k")[0], 0, "run must start at the first copy");
+        assert_eq!(
+            t.get_all(b"k").len(),
+            (fill + 1) as usize,
+            "no copy may be lost"
+        );
+        for i in 0..=fill {
+            assert_eq!(
+                t.scan_from(b"k")
+                    .filter(|(k, v)| k.as_slice() == b"k" && *v == i)
+                    .count(),
+                1,
+                "copy {i} must appear exactly once in scan order"
+            );
+        }
+        // Interleaved single-key and neighboring keys keep full order intact.
+        let pairs: Vec<(Vec<u8>, u64)> = t.iter().map(|(k, v)| (k.clone(), v)).collect();
+        assert!(pairs
+            .windows(2)
+            .all(|w| w[0].0 < w[1].0 || (w[0].0 == w[1].0 && w[0].1 <= w[1].1)));
+        // The giant "k" run sorts after every zero-prefixed numeric key and
+        // every one of its copies is present.
+        assert_eq!(
+            pairs.last().map(|(k, v)| (k.clone(), *v)),
+            Some((b"k".to_vec(), fill))
+        );
     }
 }
