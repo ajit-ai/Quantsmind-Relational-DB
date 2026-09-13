@@ -1,11 +1,13 @@
-[package]
+﻿[package]
 name = "qmind-cli"
 description = "QuantsMind interactive SQL shell"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 authors.workspace = true
 
 [dependencies]
 qmind-kernel = { workspace = true }
 qmind-sql = { workspace = true }
+
