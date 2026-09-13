@@ -31,7 +31,7 @@ desktop GUI studio and Postgres-wire-compatible server mode.
 | Point SELECT (hot) | ≥ 500K qps | **Not measured** |
 | Scan + filter (vectorized) | ≥ 50M rows/s | **Not measured** — executor is Volcano/batched, not SIMD-vectorized |
 | TPC-H Q1/Q6 (SF 0.1) | ≤ 5× DuckDB | **Not measured** — no TPC-H runner yet |
-| Recovery | zero committed-txn loss | Validated by WAL replay / restart round-trip tests; **Planned:** kill-9 chaos harness |
+| Recovery | zero committed-txn loss | Validated by WAL replay / restart round-trip tests + P3 crash-injection harness (exhaustive byte-truncation, byte-flip corruption, 300-txn MVCC→WAL→recovery property test) |
 
 ### 1.2 Non-goals (v1)
 
@@ -152,13 +152,14 @@ desktop GUI studio and Postgres-wire-compatible server mode.
 
 | Layer | Method | Status |
 |---|---|---|
-| Kernel units | unit tests + CRC/format roundtrips (61 tests) | Implemented |
+| Kernel units | unit tests + CRC/format roundtrips (62 tests) | Implemented |
+| Property/fuzz | deterministic differential harness: B+Tree vs oracle (4K ops), WAL every-byte truncation + 400 byte-flip corruptions, MVCC serial-history (1200 steps), 300-txn crash→recovery zero-loss (6 tests) | Implemented |
 | Recovery | restart round-trip / committed-state reconstruction tests | Implemented |
 | SQL semantics | e2e tests: DDL/DML/filter/project/join/aggregate/columnar | Implemented |
 | Parser robustness | handwritten fuzz harness (8K inputs) | Implemented |
 | Soak | 10K-row lifecycle test | Implemented |
 | Perf | criterion benches (`kernel_bench`, `sql_bench`) | Implemented (run manually; bench-compile gated in CI) |
-| Concurrency | loom / crash-inject / sqllogictest / cargo-fuzz | **Planned** |
+| Concurrency | loom / crash-inject / sqllogictest / cargo-fuzz | crash-injection done (in-process torn-tail + corruption harnesses, P3); loom macro-fuzz parity still **Planned** |
 
 ## 8. Repository layout
 
@@ -183,7 +184,7 @@ packaging/        # install/uninstall scripts (Windows/Linux/macOS/FreeBSD)
 
 | Risk | Mitigation |
 |---|---|
-| MVCC/recovery subtle bugs | crash-injection harness (planned), fuzz + conservative invariants |
+| MVCC/recovery subtle bugs | P3 crash-injection harness (torn-tail/truncation + byte-flip corruption + 300-txn recovery property test), fuzz + conservative invariants |
 | Optimizer scope creep | plan-lite today; rule-based only after correctness is solid |
 | Format churn | D-003 versioned headers implemented; migration tooling planned |
 | Perf tuning death valley | numeric exit criteria per milestone; columnar/vectorized metics pending |
