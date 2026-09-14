@@ -1,10 +1,12 @@
 # QuantsMind Relational Database Engine
 
-> **Status: Developer Preview / Experimental** — feature-complete for its SQL subset; not yet production-hardened (see [Architecture](https://ajit-ai.github.io/Quantsmind-Relational-DB/architecture.html) for honest gaps).
+> **Status: Developer Preview / Experimental** — feature-complete for its SQL subset; not yet production-hardened (see [Architecture](docs/architecture.rst) for honest gaps).
 
 An embeddable relational database engine written in Rust, designed for hybrid transactional + analytical workloads (HTAP). Ships as a library, a Postgres-wire-compatible server, a CLI shell, and a native desktop GUI studio.
 
-**Version 0.1.0** · MIT License · [Docs site](https://ajit-ai.github.io/Quantsmind-Relational-DB/) · [Architecture](https://ajit-ai.github.io/Quantsmind-Relational-DB/architecture.html) · [Roadmap](https://ajit-ai.github.io/Quantsmind-Relational-DB/roadmap.html) · [Quickstart](https://ajit-ai.github.io/Quantsmind-Relational-DB/quickstart.html)
+**Version 0.1.0** · MIT License · Docs (RST sources live in [`docs/`](docs/index.rst); published site URLs below activate once GitHub Pages is enabled — see the [`docs.yml`](.github/workflows/docs.yml) workflow header for the opt-in publish step)
+
+**Docs, offline:** build the site locally with `make -C docs html` (or `sphinx-build -b html docs docs/_build/html`, needs `pip install -r docs/requirements.txt`), then open `docs/_build/html/index.html`. Every docs change on `main` also ships the rendered HTML as the `docs-html` workflow artifact.
 
 ---
 
@@ -130,12 +132,12 @@ Quantsmind-Relational-DB/
 │   ├── QmindStudio.tsx        # main studio UI
 │   └── lib/desktop.ts         # typed Tauri bridge
 ├── docs/
-│   ├── index.rst               # docs site (RST, Sphinx → GitHub Pages)
+│   ├── index.rst               # docs source of truth (RST, Sphinx)
 │   ├── architecture.rst        # design decisions, kernel spec
 │   ├── roadmap.rst             # milestones M0–M9, phases P2–P12
 │   ├── quickstart.rst          # build/run/embed guide
 │   └── conf.py                 # Sphinx config
-└── .github/workflows/         # CI gates + docs deploy
+└── .github/workflows/         # CI gates + docs build (Pages opt-in)
 ```
 
 ---
@@ -541,13 +543,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 | Kernel unit | 62 | Pages, buffer pool, B+Tree, WAL, MVCC, locks, recovery, eviction, file store, columnar (M8) |
 | Kernel property/fuzz | 6 | Differential B+Tree, WAL truncation/corruption, MVCC serial history, crash→recovery zero-loss |
 | Kernel integration | 3 | Cross-store roundtrip |
+| Kernel read stress (P5) | 6 | Snapshot readers vs live writer: monotonicity, frozen snapshots, watermark advance |
 | SQL e2e | 23 | DDL, DML, WHERE, expressions, ORDER BY, LIMIT, JOIN, GROUP BY, aggregates, columnar HTAP (M9), secondary indexes (P4) |
+| SQL concurrency (P5) | 4 | Torn-batch detection, snapshot consistency, read/write gate, concurrent writers |
 | SQL unit (parser/codec/executor) | 30 | Tokenizer, AST, case-insensitivity, strings, expression grammar, sort null-ordering, operators |
 | Parser fuzz | 4 | 8K random inputs, no panics |
 | Soak test | 1 | 10K row lifecycle across multiple tables |
-| Wire protocol | 1 | TCP e2e (simple Query) |
+| Wire protocol | 2 | TCP e2e (simple Query) + concurrent-reader no-torn-read (P5) |
 | Embedded API | 2 | JSON API contract |
-| **Total** | **132** | **All green, clippy clean** |
+| **Total** | **143** | **All green, clippy clean** |
 
 ---
 

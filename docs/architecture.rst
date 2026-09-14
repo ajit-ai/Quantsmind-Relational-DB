@@ -130,8 +130,8 @@ Row store & B+Tree (M1–M4)
   the same kernel B+Tree; single-column, NULL-excluded. ``CREATE INDEX`` /
   ``DROP INDEX`` DDL, backfill at create, maintenance on INSERT, and a planner
   serving ``col = literal`` equality point-lookups (residual WHERE remains a
-  filter). Range lookups and NULL entries are not indexed; SQL requests still
-  serialize on an engine mutex (single writer; see §5).
+  filter). Range lookups and NULL entries are not indexed. Writes serialize on
+  a single engine writer; reads run concurrently over snapshots (§5).
 
 WAL & recovery (M1–M2)
 ----------------------
@@ -193,10 +193,18 @@ SQL layer (Implemented; scope is a strict subset)
 Concurrency model (honest)
 ==========================
 
-- SQL facade serializes on ``Mutex<Engine>`` / ``Arc<Mutex<Engine>>`` — safe
-  single writer, no multi-writer concurrency. MVCC gives snapshot reads, but
-  reader concurrency is not yet exploited at the SQL level.
-- **Planned:** snapshot-aware lock-free reads; multi-writer groundwork.
+- **Implemented (P5).** The SQL facade lives behind ``RwLock<Engine>``.
+  ``Engine::execute_read(&self)`` (SELECT / SHOW only) captures one MVCC
+  snapshot under a brief shared read guard, then scans lock-free — readers
+  never block each other and never wait for the writer's commit. Statements
+  observe a single point-in-time even across multi-table JOINs because one
+  snapshot is threaded through the whole read pipeline.
+- Writes remain single-writer: only DML/DDL take the exclusive guard and the
+  engine commits transactions serially (first-committer-wins validation still
+  governs stale writers at the kernel level).
+- **In-memory** snapshot capture is cheap (one watermark copy); persistence of
+  snapshots across the WAL is the Multi-writer/durable-snapshot work that
+  remains **Planned** alongside Read Committed / SSI.
 
 Server & clients (Implement status)
 ===================================

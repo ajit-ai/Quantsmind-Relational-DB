@@ -1,14 +1,19 @@
 //! Minimal Postgres wire-protocol (v3) listener over blocking TCP.
 //! Scope (M5a): trust auth, simple Query protocol. Values as TEXT (OID 25).
+//! P5: SELECT/SHOW ride the read side of an `RwLock` and run on snapshots, so
+//! readers never block each other or wait for the writer's commit.
 use qmind_sql::{Engine, SqlValue};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 const PROTOCOL_V3: i32 = 196608;
-pub type SharedEngine = Arc<Mutex<Engine<std::fs::File>>>;
+pub type SharedEngine = Arc<RwLock<Engine<std::fs::File>>>;
 
-pub fn serve<W: Write + Send + 'static>(listener: TcpListener, engine: Arc<Mutex<Engine<W>>>) {
+pub fn serve<W: Write + Send + Sync + 'static>(
+    listener: TcpListener,
+    engine: Arc<RwLock<Engine<W>>>,
+) {
     for stream in listener.incoming() {
         let Ok(s) = stream else { continue };
         let e = Arc::clone(&engine);
@@ -34,7 +39,7 @@ fn read_packet(stream: &mut TcpStream) -> std::io::Result<Option<(u8, Vec<u8>)>>
     Ok(Some((t[0], p)))
 }
 
-fn handle_conn<W: Write>(mut s: TcpStream, eng: Arc<Mutex<Engine<W>>>) -> std::io::Result<()> {
+fn handle_conn<W: Write>(mut s: TcpStream, eng: Arc<RwLock<Engine<W>>>) -> std::io::Result<()> {
     let mut lb = [0u8; 4];
     if s.read_exact(&mut lb).is_err() {
         return Ok(());
@@ -82,7 +87,7 @@ fn handle_conn<W: Write>(mut s: TcpStream, eng: Arc<Mutex<Engine<W>>>) -> std::i
 
 fn run_query<W: Write>(
     s: &mut TcpStream,
-    eng: &Arc<Mutex<Engine<W>>>,
+    eng: &Arc<RwLock<Engine<W>>>,
     sql: &str,
 ) -> std::io::Result<()> {
     // Multiple statements separated by ';' execute sequentially.
@@ -96,14 +101,29 @@ fn run_query<W: Write>(
         return ready(s);
     }
     for st in stmts {
-        let mut guard = match eng.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                error(s, "engine poisoned")?;
-                return ready(s);
-            }
+        // P5: route by leading keyword — reads run on a shared guard via
+        // `execute_read` (snapshot), writes take the exclusive guard.
+        let kw = st.split_whitespace().next().map(|w| w.to_ascii_uppercase());
+        let res = if matches!(kw.as_deref(), Some("SELECT") | Some("SHOW")) {
+            let guard = match eng.read() {
+                Ok(g) => g,
+                Err(_) => {
+                    error(s, "engine poisoned")?;
+                    return ready(s);
+                }
+            };
+            guard.execute_read(st)
+        } else {
+            let mut guard = match eng.write() {
+                Ok(g) => g,
+                Err(_) => {
+                    error(s, "engine poisoned")?;
+                    return ready(s);
+                }
+            };
+            guard.execute(st)
         };
-        match guard.execute(st) {
+        match res {
             Ok(res) => {
                 if !res.columns.is_empty() {
                     row_description(s, &res.columns)?;
@@ -133,7 +153,6 @@ fn run_query<W: Write>(
                 )?;
             }
             Err(e) => {
-                drop(guard);
                 error(s, &e)?;
                 break;
             }
