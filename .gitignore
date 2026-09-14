@@ -31,3 +31,7 @@ src-tauri/target
 
 # Bolt tool artifacts (bolt.new template config)
 .bolt/
+
+# Sphinx docs build output
+docs/_build/
+docs/*.pyc

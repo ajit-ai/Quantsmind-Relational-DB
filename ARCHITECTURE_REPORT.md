@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-QuantsMind is an embeddable relational database engine written in Rust, currently a **Developer Preview / Experimental** build. It is designed for **Hybrid Transactional-Analytical Processing (HTAP)** workloads — serving high-throughput OLTP writes and OLAP analytical scans from the same engine. It is not yet production-hardened (honest gaps in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).
+QuantsMind is an embeddable relational database engine written in Rust, currently a **Developer Preview / Experimental** build. It is designed for **Hybrid Transactional-Analytical Processing (HTAP)** workloads — serving high-throughput OLTP writes and OLAP analytical scans from the same engine. It is not yet production-hardened (honest gaps in [docs/architecture.rst](docs/architecture.rst)).
 
 ### Key Numbers
 

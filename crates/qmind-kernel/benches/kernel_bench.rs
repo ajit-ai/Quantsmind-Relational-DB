@@ -10,7 +10,7 @@ fn bench_page_header_encode(c: &mut Criterion) {
     });
 }
 
-/// Contract (docs/ROADMAP.md M1): >= 500K inserts/s single-threaded.
+/// Contract (docs/roadmap.rst M1): >= 500K inserts/s single-threaded.
 fn bench_btree_insert_100k(c: &mut Criterion) {
     let mut group = c.benchmark_group("btree");
     group.throughput(criterion::Throughput::Elements(100_000));

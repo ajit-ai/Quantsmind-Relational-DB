@@ -1,10 +1,10 @@
 # QuantsMind Relational Database Engine
 
-> **Status: Developer Preview / Experimental** — feature-complete for its SQL subset; not yet production-hardened (see [Architecture](docs/ARCHITECTURE.md) for honest gaps).
+> **Status: Developer Preview / Experimental** — feature-complete for its SQL subset; not yet production-hardened (see [Architecture](https://ajit-ai.github.io/Quantsmind-Relational-DB/architecture.html) for honest gaps).
 
 An embeddable relational database engine written in Rust, designed for hybrid transactional + analytical workloads (HTAP). Ships as a library, a Postgres-wire-compatible server, a CLI shell, and a native desktop GUI studio.
 
-**Version 0.1.0** · MIT License · [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md)
+**Version 0.1.0** · MIT License · [Docs site](https://ajit-ai.github.io/Quantsmind-Relational-DB/) · [Architecture](https://ajit-ai.github.io/Quantsmind-Relational-DB/architecture.html) · [Roadmap](https://ajit-ai.github.io/Quantsmind-Relational-DB/roadmap.html) · [Quickstart](https://ajit-ai.github.io/Quantsmind-Relational-DB/quickstart.html)
 
 ---
 
@@ -130,9 +130,12 @@ Quantsmind-Relational-DB/
 │   ├── QmindStudio.tsx        # main studio UI
 │   └── lib/desktop.ts         # typed Tauri bridge
 ├── docs/
-│   ├── ARCHITECTURE.md        # design decisions, kernel spec
-│   └── ROADMAP.md             # milestones M0–M8, E1–E5
-└── .github/workflows/ci.yml   # CI: fmt + clippy + test (Win/Linux)
+│   ├── index.rst               # docs site (RST, Sphinx → GitHub Pages)
+│   ├── architecture.rst        # design decisions, kernel spec
+│   ├── roadmap.rst             # milestones M0–M9, phases P2–P12
+│   ├── quickstart.rst          # build/run/embed guide
+│   └── conf.py                 # Sphinx config
+└── .github/workflows/         # CI gates + docs deploy
 ```
 
 ---
@@ -588,7 +591,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | M7 | Hardening (fuzzing, soak, packaging, v0.1.0) | Done |
 | M8 | Persistent columnar replica (full HTAP) | Done |
 | M9 | Columnar integration into SQL engine | Done |
-| P2–P12 | Production arc (correctness, concurrency, perf, ops, 1.0 GA) | Planned — see [ROADMAP](docs/ROADMAP.md) |
+| P2–P12 | Production arc (correctness, concurrency, perf, ops, 1.0 GA) | Planned — see [Roadmap](https://ajit-ai.github.io/Quantsmind-Relational-DB/roadmap.html) |
 
 ---
 
