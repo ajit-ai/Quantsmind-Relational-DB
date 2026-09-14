@@ -53,8 +53,9 @@ Milestones
 Current state
 =============
 
-- 132 tests green (71 kernel [62 unit + 6 property + 3 integration] + 58 SQL
-  [30 unit + 4 fuzz + 1 soak + 23 e2e] + 2 embed + 1 wire).
+- 143 tests green (77 kernel [62 unit + 6 property + 3 integration + 6 read
+  stress] + 62 SQL [30 unit + 4 fuzz + 1 soak + 23 e2e + 4 concurrency] +
+  2 embed + 2 wire).
 - ``cargo fmt --check``, ``cargo clippy -D warnings``, ``cargo test`` all green
   on CI (Ubuntu + Windows).
 - Performance measured: B+Tree insert 3.56M elem/s, WAL 2.5M rec/s (release).
@@ -70,7 +71,8 @@ Known limitations (documented, not bugs)
   for equality point lookups (range scans still go through the full scan).
 - JOIN projections are plain columns only (no aggregates over joins, no
   JOIN+GROUP BY).
-- Single-writer engine mutex; no multi-writer concurrency.
+- Reads are fully concurrent (MVCC snapshots on a shared read guard); writes
+  are still serialized to one writer (single-writer commit).
 - Server: trust auth only, no TLS, simple Query only.
 - GUI: rich components still bound to a PGlite prototype, not the Rust engine.
 
@@ -104,7 +106,7 @@ Next phases (toward production-grade)
      - Concurrency
      - Core
      - snapshot reads lock-free; multi-writer groundwork; read stress tests
-     - ⬜ (*in progress*)
+     - ✅
    * - P6
      - Server hardening
      - Product
@@ -292,4 +294,32 @@ richer predicates, **P4b** ORDER BY/sort, **P4c** secondary indexes.
   6 new parser unit tests.
 
 ``cargo test --workspace`` green (132), ``cargo fmt --check`` and
+``cargo clippy -D warnings`` green.
+
+P5 — Concurrency
+----------------
+
+Reads and writes no longer share one mutex:
+
+- **Kernel**: ``MvccStore::snapshot(&self)`` captures the commit watermark as a
+  lock-free read horizon. Pure readers take the engine read guard only for a
+  microsecond to copy the watermark, then scan lock-free; a read is only ever
+  as fresh as the last commit it saw.
+- **SQL engine**: the read path is fully ``&self`` — ``execute_read(&self)``
+  accepts SELECT/SHOW only and threads a single ``Snapshot`` through select,
+  scan, GROUP BY, aggregates, JOIN, and index-assisted lookup, so one
+  statement observes one point-in-time even across multi-table JOINs.
+  ``Engine::execute_read`` rejects write statements outright.
+- **Server**: ``SharedEngine`` moved from ``Arc<Mutex<_>>`` to
+  ``Arc<RwLock<_>>``. ``SELECT``/``SHOW`` ride the shared guard via
+  ``execute_read``; only writes take the exclusive guard. Reads can never block
+  each other; the writer is blocked only while a reader captures its snapshot.
+- **New tests** — ``read_stress.rs`` (kernel): rotating-key writer vs 4 readers
+  (per-key monotonicity, frozen long-lived snapshot, watermark advance), and
+  ``concurrency.rs`` (SQL): torn-batch detection over 20-row commits, snapshot
+  consistency (COUNT == MAX(id)+1), read/write gate, concurrent writers with
+  zero lost rows; plus a two-connection wire e2e with 4 concurrent SELECT
+  counters against a live writer (COUNT % batch == 1, never torn).
+
+``cargo test --workspace`` green (143), ``cargo fmt --check`` and
 ``cargo clippy -D warnings`` green.

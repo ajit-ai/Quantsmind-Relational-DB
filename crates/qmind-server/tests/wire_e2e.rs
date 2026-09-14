@@ -1,12 +1,12 @@
 //! M5: full wire-protocol roundtrip over real TCP sockets.
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 fn start_server() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let eng = Arc::new(Mutex::new(qmind_sql::Engine::new(Vec::new())));
+    let eng = Arc::new(RwLock::new(qmind_sql::Engine::new(Vec::new())));
     std::thread::spawn(move || qmind_server::wire::serve(listener, eng));
     port
 }
@@ -100,4 +100,45 @@ fn wire_end_to_end_sql_over_tcp() {
     let mut c2 = connect(port);
     let rows = query(&mut c2, "SELECT COUNT(*) FROM net_users;");
     assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+#[test]
+fn concurrent_readers_never_see_torn_writes() {
+    let port = start_server();
+    let mut c = connect(port);
+    query(&mut c, "CREATE TABLE counters (id INTEGER, v INTEGER);");
+    query(&mut c, "INSERT INTO counters VALUES (1, 0);");
+
+    // Writer appends 20-row batches as single multi-row commits.
+    let writer = std::thread::spawn(move || {
+        let mut wc = connect(port);
+        for b in 0..10u64 {
+            let values: Vec<String> = (0..20u64)
+                .map(|i| format!("({}, {})", 1000 + b * 20 + i, i))
+                .collect();
+            query(
+                &mut wc,
+                &format!("INSERT INTO counters VALUES {};", values.join(",")),
+            );
+        }
+    });
+
+    // Readers run COUNT concurrently; under snapshot isolation every observed
+    // count must be a fully-committed batch boundary (1 + 20k), never torn.
+    let mut readers = Vec::new();
+    for _ in 0..4 {
+        let p = port;
+        readers.push(std::thread::spawn(move || {
+            let mut rc = connect(p);
+            for _ in 0..80 {
+                let rows = query(&mut rc, "SELECT COUNT(*) FROM counters;");
+                let n: u64 = rows[0][0].parse().unwrap();
+                assert_eq!(n % 20, 1, "reader observed a torn commit: count={n}");
+            }
+        }));
+    }
+    for h in readers {
+        h.join().unwrap();
+    }
+    writer.join().unwrap();
 }

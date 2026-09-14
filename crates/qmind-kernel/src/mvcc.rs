@@ -120,6 +120,18 @@ impl MvccStore {
         (txn, snap)
     }
 
+    /// Lock-free snapshot capture for pure readers (P5).
+    ///
+    /// A reader takes the engine-level read guard, captures this watermark,
+    /// drops the guard, and scans with the immutable `Snapshot` — reads never
+    /// contend with each other or block the writer's commit. The snapshot is
+    /// only as fresh as the last commit seen by this thread.
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            read_ts: self.mgr.commit_watermark(),
+        }
+    }
+
     /// Read `key` under `snap`, seeing the transaction's own buffered writes
     /// first (read-your-own-writes).
     pub fn get(&self, txn: TxnId, key: &[u8], snap: &Snapshot) -> Option<Vec<u8>> {

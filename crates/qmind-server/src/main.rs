@@ -5,7 +5,7 @@ use qmind_server::wire;
 
 use qmind_sql::Engine;
 use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 fn main() {
     let port: u16 = std::env::args()
@@ -18,7 +18,7 @@ fn main() {
         .append(true)
         .open("qmind-data/wal.log")
         .expect("open wal");
-    let engine = Arc::new(Mutex::new(Engine::new(wal)));
+    let engine = Arc::new(RwLock::new(Engine::new(wal)));
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr).expect("bind");
     println!(

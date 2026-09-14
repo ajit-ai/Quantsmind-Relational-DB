@@ -17,7 +17,7 @@ use crate::parser::{self, BinOp, DataType, Expr, SelectItem, Statement, TableRef
 use qmind_kernel::column_delta::{ColumnDataType, ColumnInfo, DeltaApplier, TableSchema};
 use qmind_kernel::column_reader::ColumnarReader;
 use qmind_kernel::columnar::ColValue;
-use qmind_kernel::{BTree, MvccStore, WalWriter};
+use qmind_kernel::{BTree, MvccStore, Snapshot, WalWriter};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -170,25 +170,52 @@ impl<W: Write> Engine<W> {
                 if_not_exists,
             } => self.create_table(name, columns, *if_not_exists),
             Statement::Insert { table, rows } => self.insert(table, rows),
-            Statement::Select(sel) => self.select(sel),
+            Statement::Select(sel) => {
+                let snap = self.db.snapshot();
+                self.select(sel, &snap)
+            }
             Statement::CreateIndex {
                 name,
                 table,
                 columns,
             } => self.create_index(name, table, columns),
             Statement::DropIndex { name } => self.drop_index(name),
-            Statement::ShowTables => {
-                let mut names: Vec<String> = self.tables.keys().cloned().collect();
-                names.sort();
-                Ok(ExecResult {
-                    columns: vec!["table".into()],
-                    rows: names.into_iter().map(|n| vec![SqlValue::Text(n)]).collect(),
-                    rows_affected: 0,
-                })
-            }
+            Statement::ShowTables => self.show_tables(),
         }
     }
 
+    /// Parse + execute a read-only statement (SELECT / SHOW TABLES).
+    ///
+    /// Unlike [`execute`](Self::execute), this takes `&self` and captures one
+    /// snapshot for the whole statement, so the read observes a single
+    /// point-in-time even across a multi-table JOIN. Concurrent readers can
+    /// run in parallel under a shared read guard; the scan itself is lock-free
+    /// against the writer's commit once the snapshot is captured.
+    pub fn execute_read(&self, sql: &str) -> Result<ExecResult, String> {
+        let stmts = parser::Parser::parse(sql)?;
+        if stmts.len() != 1 {
+            return Err(format!(
+                "expected exactly one statement, got {}",
+                stmts.len()
+            ));
+        }
+        let snap = self.db.snapshot();
+        match &stmts[0] {
+            Statement::Select(sel) => self.select(sel, &snap),
+            Statement::ShowTables => self.show_tables(),
+            _ => Err("statement requires a write connection (use execute)".into()),
+        }
+    }
+
+    fn show_tables(&self) -> Result<ExecResult, String> {
+        let mut names: Vec<String> = self.tables.keys().cloned().collect();
+        names.sort();
+        Ok(ExecResult {
+            columns: vec!["table".into()],
+            rows: names.into_iter().map(|n| vec![SqlValue::Text(n)]).collect(),
+            rows_affected: 0,
+        })
+    }
     fn create_table(
         &mut self,
         name: &str,
@@ -245,7 +272,8 @@ impl<W: Write> Engine<W> {
 
         // Backfill from existing rows.
         let mut tree = BTree::new();
-        let rows = self.scan_table_rows(table, &schema);
+        let snap = self.db.snapshot();
+        let rows = self.scan_table_rows(table, &schema, &snap);
         for (rid, row) in rows.iter().enumerate() {
             let v = &row[col_pos(&schema, &column)?];
             if *v != SqlValue::Null {
@@ -349,10 +377,10 @@ impl<W: Write> Engine<W> {
         })
     }
 
-    fn select(&mut self, sel: &parser::Select) -> Result<ExecResult, String> {
+    fn select(&self, sel: &parser::Select, snap: &Snapshot) -> Result<ExecResult, String> {
         // JOIN path.
         if matches!(&sel.from, TableRef::Join { .. }) {
-            return self.select_join(sel);
+            return self.select_join(sel, snap);
         }
 
         let table = match &sel.from {
@@ -373,33 +401,32 @@ impl<W: Write> Engine<W> {
 
         // GROUP BY path.
         if !sel.group_by.is_empty() {
-            return self.select_group_by(sel, &schema, &table);
+            return self.select_group_by(sel, &schema, &table, snap);
         }
 
         // Aggregate fast path (no GROUP BY).
         if let Some(aggs) = try_parse_aggregates(&sel.projection, &schema)? {
-            return self.select_aggregates(sel, &schema, &table, aggs);
+            return self.select_aggregates(sel, &schema, &table, aggs, snap);
         }
 
         // General pipeline over the MVCC row store.
         // P4c: index-assisted point lookup (top-level `col = literal`
         // conjunct backed by a secondary index).
-        if let Some((rows, residual)) = self.index_lookup(&table, &schema, &sel.selection)? {
+        if let Some((rows, residual)) = self.index_lookup(&table, &schema, &sel.selection, snap)? {
             let mut sel2 = sel.clone();
             sel2.selection = residual;
             return self.run_select(&sel2, &schema, rows);
         }
-        let rows = self.scan_table_rows(&table, &schema);
+        let rows = self.scan_table_rows(&table, &schema, snap);
         self.run_select(sel, &schema, rows)
     }
 
     /// Materialized MVCC snapshot scan of an entire table.
-    fn scan_table_rows(&mut self, table: &str, schema: &[ColumnDef]) -> Vec<Row> {
-        let (_, snap) = self.db.begin();
+    fn scan_table_rows(&self, table: &str, schema: &[ColumnDef], snap: &Snapshot) -> Vec<Row> {
         let mut rows = Vec::new();
         for rid in 0..*self.next_row_id.get(table).unwrap_or(&0) {
             let key = row_key(table, rid);
-            if let Some(raw) = self.db.get_raw(&key, &snap) {
+            if let Some(raw) = self.db.get_raw(&key, snap) {
                 if let Some(full) = decode_row(&raw, schema) {
                     rows.push(full);
                 }
@@ -416,10 +443,11 @@ impl<W: Write> Engine<W> {
     /// conjunct removed (`None` when it was the whole WHERE clause). Returns
     /// `None` overall when no usable conjunct exists.
     fn index_lookup(
-        &mut self,
+        &self,
         table: &str,
         schema: &[ColumnDef],
         selection: &Option<Expr>,
+        snap: &Snapshot,
     ) -> Result<Option<IndexLookup>, String> {
         let Some(pred) = selection else {
             return Ok(None);
@@ -459,10 +487,9 @@ impl<W: Write> Engine<W> {
                 .ok_or_else(|| format!("index `{idx_name}` missing tree"))?
                 .get_all(&key);
 
-            let (_, snap) = self.db.begin();
             let mut rows = Vec::new();
             for rid in rids {
-                if let Some(raw) = self.db.get_raw(&row_key(table, rid), &snap) {
+                if let Some(raw) = self.db.get_raw(&row_key(table, rid), snap) {
                     if let Some(full) = decode_row(&raw, schema) {
                         rows.push(full);
                     }
@@ -475,7 +502,6 @@ impl<W: Write> Engine<W> {
     }
 
     /// Shared OLTP/OLAP pipeline: scan → filter → ORDER BY → project → limit.
-    /// Projection and ORDER BY evaluate full expressions over the source row.
     fn run_select(
         &self,
         sel: &parser::Select,
@@ -534,13 +560,14 @@ impl<W: Write> Engine<W> {
 
     /// Ungrouped aggregate (`SELECT COUNT(*), SUM(v) ... FROM t [WHERE ..]`).
     fn select_aggregates(
-        &mut self,
+        &self,
         sel: &parser::Select,
         schema: &[ColumnDef],
         table: &str,
         aggs: Vec<Aggregate>,
+        snap: &Snapshot,
     ) -> Result<ExecResult, String> {
-        let rows = self.scan_table_rows(table, schema);
+        let rows = self.scan_table_rows(table, schema, snap);
         let mut filtered = Vec::new();
         for row in rows {
             match &sel.selection {
@@ -559,7 +586,7 @@ impl<W: Write> Engine<W> {
         })
     }
 
-    fn select_join(&mut self, sel: &parser::Select) -> Result<ExecResult, String> {
+    fn select_join(&self, sel: &parser::Select, snap: &Snapshot) -> Result<ExecResult, String> {
         let (left, right, on_expr) = match &sel.from {
             TableRef::Join { left, right, on } => match left.as_ref() {
                 TableRef::Table(lt) => (lt.clone(), right.clone(), on.clone()),
@@ -622,8 +649,8 @@ impl<W: Write> Engine<W> {
         };
         let (li, ri) = (lside.0 as usize, rside.0 as usize);
 
-        let left_rows: Vec<Row> = self.scan_table_rows(&left, &lschema);
-        let right_rows: Vec<Row> = self.scan_table_rows(&right, &rschema);
+        let left_rows: Vec<Row> = self.scan_table_rows(&left, &lschema, snap);
+        let right_rows: Vec<Row> = self.scan_table_rows(&right, &rschema, snap);
 
         let mut op: Box<dyn Operator> = Box::new(HashJoin::new(
             Box::new(VecScan::new(left_rows)),
@@ -682,10 +709,11 @@ impl<W: Write> Engine<W> {
     }
 
     fn select_group_by(
-        &mut self,
+        &self,
         sel: &parser::Select,
         schema: &[ColumnDef],
         table: &str,
+        snap: &Snapshot,
     ) -> Result<ExecResult, String> {
         let mut key_idx = Vec::with_capacity(sel.group_by.len());
         for e in &sel.group_by {
@@ -749,12 +777,10 @@ impl<W: Write> Engine<W> {
             }
         }
 
-        let (_, snap) = self.db.begin();
-
         let mut raw_rows: Vec<Row> = Vec::new();
         for rid in 0..*self.next_row_id.get(table).unwrap_or(&0) {
             let key = row_key(table, rid);
-            if let Some(raw) = self.db.get_raw(&key, &snap) {
+            if let Some(raw) = self.db.get_raw(&key, snap) {
                 if let Some(full) = decode_row(&raw, schema) {
                     if let Some(pred) = &sel.selection {
                         if !is_true(&eval_expr(pred, schema, &full)?)? {
