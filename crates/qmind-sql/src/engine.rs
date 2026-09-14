@@ -10,12 +10,14 @@
 
 use crate::codec::{decode_row, encode_row, row_key, ColumnDef, ColumnType, SqlValue};
 use crate::executor::Row;
-use crate::executor::{Filter, HashAggregate, HashJoin, Limit, Operator, Project, VecScan};
-use crate::parser::{self, BinOp, DataType, Expr, SelectItem, Statement, TableRef};
+use crate::executor::{
+    Filter, HashAggregate, HashJoin, Limit, Operator, Project, Scan, Sort, VecScan,
+};
+use crate::parser::{self, BinOp, DataType, Expr, SelectItem, Statement, TableRef, UnaryOp};
 use qmind_kernel::column_delta::{ColumnDataType, ColumnInfo, DeltaApplier, TableSchema};
 use qmind_kernel::column_reader::ColumnarReader;
 use qmind_kernel::columnar::ColValue;
-use qmind_kernel::{MvccStore, WalWriter};
+use qmind_kernel::{BTree, MvccStore, WalWriter};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -44,6 +46,10 @@ pub struct Engine<W: Write> {
     wal: WalWriter<W>,
     tables: HashMap<String, Vec<ColumnDef>>,
     next_row_id: HashMap<String, u64>,
+    /// Secondary indexes: index name → definition.
+    indexes: HashMap<String, IndexDef>,
+    /// In-memory index trees (single-column, keyed by order-preserving encoding).
+    index_trees: HashMap<String, BTree>,
     /// Optional columnar segment directory for HTAP OLAP reads.
     columnar_dir: Option<PathBuf>,
     /// Delta buffer accumulates rows for async columnar flush.
@@ -52,6 +58,18 @@ pub struct Engine<W: Write> {
     columnar_flush_threshold: usize,
 }
 
+/// Secondary index definition. Indexes are single-column, non-NULL.
+#[derive(Debug, Clone)]
+pub struct IndexDef {
+    pub name: String,
+    pub table: String,
+    pub column: String,
+}
+
+/// Result of an index-assisted lookup: matched rows plus the predicate with
+/// the served conjunct removed (`None` when the conjunct was the whole WHERE).
+type IndexLookup = (Vec<Row>, Option<Expr>);
+
 impl<W: Write> Engine<W> {
     pub fn new(wal_sink: W) -> Self {
         Self {
@@ -59,6 +77,8 @@ impl<W: Write> Engine<W> {
             wal: WalWriter::new(wal_sink),
             tables: HashMap::new(),
             next_row_id: HashMap::new(),
+            indexes: HashMap::new(),
+            index_trees: HashMap::new(),
             columnar_dir: None,
             delta_applier: None,
             columnar_flush_threshold: 10_000,
@@ -151,6 +171,12 @@ impl<W: Write> Engine<W> {
             } => self.create_table(name, columns, *if_not_exists),
             Statement::Insert { table, rows } => self.insert(table, rows),
             Statement::Select(sel) => self.select(sel),
+            Statement::CreateIndex {
+                name,
+                table,
+                columns,
+            } => self.create_index(name, table, columns),
+            Statement::DropIndex { name } => self.drop_index(name),
             Statement::ShowTables => {
                 let mut names: Vec<String> = self.tables.keys().cloned().collect();
                 names.sort();
@@ -197,6 +223,56 @@ impl<W: Write> Engine<W> {
         Ok(ExecResult::empty())
     }
 
+    fn create_index(
+        &mut self,
+        name: &str,
+        table: &str,
+        columns: &[String],
+    ) -> Result<ExecResult, String> {
+        if self.indexes.contains_key(name) {
+            return Err(format!("index `{name}` already exists"));
+        }
+        if columns.len() != 1 {
+            return Err("only single-column indexes are supported".into());
+        }
+        let column = columns[0].clone();
+        let schema = self
+            .tables
+            .get(table)
+            .cloned()
+            .ok_or_else(|| format!("no table `{table}`"))?;
+        col_pos(&schema, &column)?;
+
+        // Backfill from existing rows.
+        let mut tree = BTree::new();
+        let rows = self.scan_table_rows(table, &schema);
+        for (rid, row) in rows.iter().enumerate() {
+            let v = &row[col_pos(&schema, &column)?];
+            if *v != SqlValue::Null {
+                tree.insert(&index_key_encode(v)?, rid as u64);
+            }
+        }
+
+        self.indexes.insert(
+            name.to_string(),
+            IndexDef {
+                name: name.to_string(),
+                table: table.to_string(),
+                column,
+            },
+        );
+        self.index_trees.insert(name.to_string(), tree);
+        Ok(ExecResult::empty())
+    }
+
+    fn drop_index(&mut self, name: &str) -> Result<ExecResult, String> {
+        if self.indexes.remove(name).is_none() {
+            return Err(format!("no index `{name}`"));
+        }
+        self.index_trees.remove(name);
+        Ok(ExecResult::empty())
+    }
+
     fn insert(&mut self, table: &str, rows: &[Vec<Expr>]) -> Result<ExecResult, String> {
         let schema = self
             .tables
@@ -229,6 +305,23 @@ impl<W: Write> Engine<W> {
             }
             let rid = start_id + count;
             self.db.set(txn, &row_key(table, rid), encode_row(&row));
+            // Maintain secondary indexes for the table.
+            let mut index_errors: Vec<String> = Vec::new();
+            for (idx_name, def) in self.indexes.iter().filter(|(_, def)| def.table == table) {
+                let col_idx = col_pos(&schema, &def.column)?;
+                let v = &row[col_idx];
+                if *v != SqlValue::Null {
+                    match self.index_trees.get_mut(idx_name) {
+                        Some(tree) => {
+                            tree.insert(&index_key_encode(v).map_err(|e| e.to_string())?, rid)
+                        }
+                        None => index_errors.push(format!("index `{idx_name}` tree missing")),
+                    }
+                }
+            }
+            if let Some(e) = index_errors.first() {
+                return Err(e.clone());
+            }
             // M9: Capture row for columnar delta buffer.
             if let Some(ref mut applier) = self.delta_applier {
                 let col_values: Vec<ColValue> = row.iter().map(sql_value_to_col_value).collect();
@@ -274,7 +367,8 @@ impl<W: Write> Engine<W> {
 
         // M9: Columnar OLAP path — read from columnar segments if available.
         if self.has_columnar_data(&table) {
-            return self.select_from_columnar(sel, &schema, &table);
+            let rows = self.read_columnar(&table, &schema)?;
+            return self.run_select(sel, &schema, rows);
         }
 
         // GROUP BY path.
@@ -284,155 +378,183 @@ impl<W: Write> Engine<W> {
 
         // Aggregate fast path (no GROUP BY).
         if let Some(aggs) = try_parse_aggregates(&sel.projection, &schema)? {
-            let (_, snap) = self.db.begin();
-            let mut rows = Vec::new();
-            for rid in 0..*self.next_row_id.get(&table).unwrap_or(&0) {
-                let key = row_key(&table, rid);
-                let Some(raw) = self.db.get_raw(&key, &snap) else {
-                    continue;
-                };
-                let Some(full) = decode_row(&raw, &schema) else {
-                    continue;
-                };
-                match &sel.selection {
-                    Some(pred) if !eval_predicate(pred, &schema, &full)? => continue,
-                    _ => rows.push(full),
-                }
-            }
-            let out = aggs
-                .iter()
-                .map(|a| a.evaluate(&rows))
-                .collect::<Result<Vec<_>, String>>()?;
-            return Ok(ExecResult {
-                columns: aggs.into_iter().map(|a| a.label).collect(),
-                rows: vec![out],
-                rows_affected: 0,
-            });
+            return self.select_aggregates(sel, &schema, &table, aggs);
         }
 
-        // Projection plan.
-        enum Proj {
-            All,
-            Cols(Vec<usize>),
+        // General pipeline over the MVCC row store.
+        // P4c: index-assisted point lookup (top-level `col = literal`
+        // conjunct backed by a secondary index).
+        if let Some((rows, residual)) = self.index_lookup(&table, &schema, &sel.selection)? {
+            let mut sel2 = sel.clone();
+            sel2.selection = residual;
+            return self.run_select(&sel2, &schema, rows);
         }
-        let (proj, out_cols) =
-            if sel.projection.len() == 1 && matches!(sel.projection[0], SelectItem::Star) {
-                (
-                    Proj::All,
-                    schema.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
-                )
-            } else {
-                let mut idx = Vec::new();
-                let mut names = Vec::new();
-                for item in &sel.projection {
-                    let SelectItem::Expr(Expr::Identifier(id)) = item else {
-                        return Err("only plain column projections supported".into());
-                    };
-                    let pos = schema
-                        .iter()
-                        .position(|c| c.name == id.as_str())
-                        .ok_or_else(|| format!("unknown column {id}"))?;
-                    idx.push(pos);
-                    names.push(id.clone());
-                }
-                (Proj::Cols(idx), names)
-            };
-
-        // E4b: materialize the MVCC scan, then run the Volcano pipeline.
-        let (_, snap) = self.db.begin();
-        let max_rows = sel.limit.unwrap_or(0);
-        let mut raw_rows: Vec<Row> = Vec::new();
-        for rid in 0..*self.next_row_id.get(&table).unwrap_or(&0) {
-            let key = row_key(&table, rid);
-            if let Some(raw) = self.db.get_raw(&key, &snap) {
-                if let Some(full) = decode_row(&raw, &schema) {
-                    raw_rows.push(full);
-                }
-            }
-        }
-
-        let mut op: Box<dyn Operator> = Box::new(VecScan::new(raw_rows));
-        if let Some(pred) = &sel.selection {
-            let s = schema.clone();
-            let p: Expr = pred.clone();
-            op = Box::new(Filter::new(op, move |r: &Row| eval_predicate(&p, &s, r)));
-        }
-        op = match &proj {
-            Proj::All => op,
-            Proj::Cols(idx) => Box::new(Project::new(op, idx.clone())),
-        };
-        if max_rows > 0 {
-            op = Box::new(Limit::new(op, max_rows));
-        }
-
-        let mut rows = Vec::new();
-        while let Some(r) = op.next()? {
-            rows.push(r);
-        }
-
-        Ok(ExecResult {
-            columns: out_cols,
-            rows,
-            rows_affected: 0,
-        })
+        let rows = self.scan_table_rows(&table, &schema);
+        self.run_select(sel, &schema, rows)
     }
 
-    /// M9: Read from columnar segments and apply projection/filter/limit.
-    fn select_from_columnar(
+    /// Materialized MVCC snapshot scan of an entire table.
+    fn scan_table_rows(&mut self, table: &str, schema: &[ColumnDef]) -> Vec<Row> {
+        let (_, snap) = self.db.begin();
+        let mut rows = Vec::new();
+        for rid in 0..*self.next_row_id.get(table).unwrap_or(&0) {
+            let key = row_key(table, rid);
+            if let Some(raw) = self.db.get_raw(&key, &snap) {
+                if let Some(full) = decode_row(&raw, schema) {
+                    rows.push(full);
+                }
+            }
+        }
+        rows
+    }
+
+    /// Planner: try to serve a `col = literal` conjunct from an index.
+    ///
+    /// Finds the first top-level AND conjunct of the selection that is an
+    /// equality between an indexed column and a non-NULL literal, looks up the
+    /// index, and returns the matched rows plus the predicate with that
+    /// conjunct removed (`None` when it was the whole WHERE clause). Returns
+    /// `None` overall when no usable conjunct exists.
+    fn index_lookup(
+        &mut self,
+        table: &str,
+        schema: &[ColumnDef],
+        selection: &Option<Expr>,
+    ) -> Result<Option<IndexLookup>, String> {
+        let Some(pred) = selection else {
+            return Ok(None);
+        };
+        for term in conjuncts(pred) {
+            let Expr::BinaryOp {
+                left,
+                op: BinOp::Eq,
+                right,
+            } = &term
+            else {
+                continue;
+            };
+            let Expr::Identifier(col) = left.as_ref() else {
+                continue;
+            };
+            let Some(idx_name) = self
+                .indexes
+                .values()
+                .find(|d| d.table == table && &d.column == col)
+                .map(|d| d.name.clone())
+            else {
+                continue;
+            };
+            // Only non-NULL literal equality can use the index (NULLs are
+            // not indexed, and `col = NULL` never matches under 3VL anyway).
+            let Ok(lit) = literal_value(right) else {
+                continue;
+            };
+            if lit == SqlValue::Null {
+                continue;
+            }
+            let key = index_key_encode(&lit)?;
+            let rids = self
+                .index_trees
+                .get(&idx_name)
+                .ok_or_else(|| format!("index `{idx_name}` missing tree"))?
+                .get_all(&key);
+
+            let (_, snap) = self.db.begin();
+            let mut rows = Vec::new();
+            for rid in rids {
+                if let Some(raw) = self.db.get_raw(&row_key(table, rid), &snap) {
+                    if let Some(full) = decode_row(&raw, schema) {
+                        rows.push(full);
+                    }
+                }
+            }
+            let residual = remove_conjunct(pred, &term);
+            return Ok(Some((rows, residual)));
+        }
+        Ok(None)
+    }
+
+    /// Shared OLTP/OLAP pipeline: scan → filter → ORDER BY → project → limit.
+    /// Projection and ORDER BY evaluate full expressions over the source row.
+    fn run_select(
         &self,
         sel: &parser::Select,
         schema: &[ColumnDef],
-        table: &str,
+        rows: Vec<Row>,
     ) -> Result<ExecResult, String> {
-        // Read all rows from columnar.
-        let raw_rows = self.read_columnar(table, schema)?;
+        let mut op: Box<dyn Operator> = Box::new(VecScan::new(rows));
 
-        // Determine output columns.
-        let (proj_indices, out_cols) =
-            if sel.projection.len() == 1 && matches!(sel.projection[0], SelectItem::Star) {
-                (
-                    None,
-                    schema.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
-                )
-            } else {
-                let mut idx = Vec::new();
-                let mut names = Vec::new();
-                for item in &sel.projection {
-                    let SelectItem::Expr(Expr::Identifier(id)) = item else {
-                        return Err("only plain column projections supported".into());
-                    };
-                    let pos = schema
-                        .iter()
-                        .position(|c| c.name == id.as_str())
-                        .ok_or_else(|| format!("unknown column {id}"))?;
-                    idx.push(pos);
-                    names.push(id.clone());
-                }
-                (Some(idx), names)
-            };
-
-        // Apply filter + project via Volcano pipeline.
-        let mut op: Box<dyn Operator> = Box::new(VecScan::new(raw_rows));
         if let Some(pred) = &sel.selection {
             let s = schema.to_vec();
             let p: Expr = pred.clone();
-            op = Box::new(Filter::new(op, move |r: &Row| eval_predicate(&p, &s, r)));
+            op = Box::new(Filter::new(op, move |r: &Row| {
+                is_true(&eval_expr(&p, &s, r)?)
+            }));
         }
-        if let Some(indices) = &proj_indices {
-            op = Box::new(Project::new(op, indices.clone()));
+
+        if !sel.order_by.is_empty() {
+            let s = schema.to_vec();
+            let keys: Vec<Expr> = sel.order_by.iter().map(|o| o.expr.clone()).collect();
+            let desc: Vec<bool> = sel.order_by.iter().map(|o| !o.asc).collect();
+            op = Box::new(Sort::new(op, desc, move |r: &Row| {
+                keys.iter()
+                    .map(|e| eval_expr(e, &s, r))
+                    .collect::<Result<Vec<_>, _>>()
+            }));
         }
+
+        let (exprs, out_cols) = projection_specs(sel, schema)?;
+        let s = schema.to_vec();
+        op = Box::new(Scan::new(move || {
+            let Some(r) = op.next()? else {
+                return Ok(None);
+            };
+            let mut out = Vec::with_capacity(exprs.len());
+            for e in &exprs {
+                out.push(eval_expr(e, &s, &r)?);
+            }
+            Ok(Some(out))
+        }));
+
         if let Some(limit) = sel.limit {
             op = Box::new(Limit::new(op, limit));
         }
 
-        let mut rows = Vec::new();
+        let mut out_rows = Vec::new();
         while let Some(r) = op.next()? {
-            rows.push(r);
+            out_rows.push(r);
         }
 
         Ok(ExecResult {
             columns: out_cols,
-            rows,
+            rows: out_rows,
+            rows_affected: 0,
+        })
+    }
+
+    /// Ungrouped aggregate (`SELECT COUNT(*), SUM(v) ... FROM t [WHERE ..]`).
+    fn select_aggregates(
+        &mut self,
+        sel: &parser::Select,
+        schema: &[ColumnDef],
+        table: &str,
+        aggs: Vec<Aggregate>,
+    ) -> Result<ExecResult, String> {
+        let rows = self.scan_table_rows(table, schema);
+        let mut filtered = Vec::new();
+        for row in rows {
+            match &sel.selection {
+                Some(pred) if !is_true(&eval_expr(pred, schema, &row)?)? => continue,
+                _ => filtered.push(row),
+            }
+        }
+        let out = aggs
+            .iter()
+            .map(|a| a.evaluate(&filtered))
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(ExecResult {
+            columns: aggs.into_iter().map(|a| a.label).collect(),
+            rows: vec![out],
             rows_affected: 0,
         })
     }
@@ -500,28 +622,8 @@ impl<W: Write> Engine<W> {
         };
         let (li, ri) = (lside.0 as usize, rside.0 as usize);
 
-        // E4b-2: materialize both sides, then run Volcano pipeline.
-        let (_, snap) = self.db.begin();
-        let max_rows = sel.limit.unwrap_or(0);
-
-        let mut left_rows: Vec<Row> = Vec::new();
-        for rid in 0..*self.next_row_id.get(&left).unwrap_or(&0) {
-            let key = row_key(&left, rid);
-            if let Some(raw) = self.db.get_raw(&key, &snap) {
-                if let Some(row) = decode_row(&raw, &lschema) {
-                    left_rows.push(row);
-                }
-            }
-        }
-        let mut right_rows: Vec<Row> = Vec::new();
-        for rid in 0..*self.next_row_id.get(&right).unwrap_or(&0) {
-            let key = row_key(&right, rid);
-            if let Some(raw) = self.db.get_raw(&key, &snap) {
-                if let Some(row) = decode_row(&raw, &rschema) {
-                    right_rows.push(row);
-                }
-            }
-        }
+        let left_rows: Vec<Row> = self.scan_table_rows(&left, &lschema);
+        let right_rows: Vec<Row> = self.scan_table_rows(&right, &rschema);
 
         let mut op: Box<dyn Operator> = Box::new(HashJoin::new(
             Box::new(VecScan::new(left_rows)),
@@ -534,41 +636,37 @@ impl<W: Write> Engine<W> {
         if let Some(pred) = &sel.selection {
             let c = combined.clone();
             let p: Expr = pred.clone();
-            op = Box::new(Filter::new(op, move |r: &Row| eval_predicate(&p, &c, r)));
+            op = Box::new(Filter::new(op, move |r: &Row| {
+                is_true(&eval_expr(&p, &c, r)?)
+            }));
         }
 
-        // Projection.
-        enum Proj2 {
-            All,
-            Cols(Vec<usize>),
+        if !sel.order_by.is_empty() {
+            let c = combined.clone();
+            let keys: Vec<Expr> = sel.order_by.iter().map(|o| o.expr.clone()).collect();
+            let desc: Vec<bool> = sel.order_by.iter().map(|o| !o.asc).collect();
+            op = Box::new(Sort::new(op, desc, move |r: &Row| {
+                keys.iter()
+                    .map(|e| eval_expr(e, &c, r))
+                    .collect::<Result<Vec<_>, _>>()
+            }));
         }
-        let (proj, out_cols) =
-            if sel.projection.len() == 1 && matches!(sel.projection[0], SelectItem::Star) {
-                (
-                    Proj2::All,
-                    combined.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
-                )
-            } else {
-                let mut idx = Vec::new();
-                let mut names = Vec::new();
-                for item in &sel.projection {
-                    let SelectItem::Expr(Expr::Identifier(id)) = item else {
-                        return Err("only plain column projections supported on joins".into());
-                    };
-                    let (is_l, p) = find_col(id).ok_or_else(|| format!("unknown column {id}"))?;
-                    idx.push(if is_l { p } else { lschema.len() + p });
-                    names.push(id.clone());
-                }
-                (Proj2::Cols(idx), names)
+
+        let (exprs, out_cols) = projection_specs(sel, &combined)?;
+        let c = combined.clone();
+        op = Box::new(Scan::new(move || {
+            let Some(r) = op.next()? else {
+                return Ok(None);
             };
+            let mut out = Vec::with_capacity(exprs.len());
+            for e in &exprs {
+                out.push(eval_expr(e, &c, &r)?);
+            }
+            Ok(Some(out))
+        }));
 
-        op = match &proj {
-            Proj2::All => op,
-            Proj2::Cols(idx) => Box::new(Project::new(op, idx.clone())),
-        };
-
-        if max_rows > 0 {
-            op = Box::new(Limit::new(op, max_rows));
+        if let Some(limit) = sel.limit {
+            op = Box::new(Limit::new(op, limit));
         }
 
         let mut out_rows = Vec::new();
@@ -594,11 +692,7 @@ impl<W: Write> Engine<W> {
             let Expr::Identifier(id) = e else {
                 return Err("GROUP BY supports plain columns only".into());
             };
-            let pos = schema
-                .iter()
-                .position(|c| c.name == id.as_str())
-                .ok_or_else(|| format!("unknown column {id}"))?;
-            key_idx.push(pos);
+            key_idx.push(col_pos(schema, id)?);
         }
 
         enum Item {
@@ -608,8 +702,11 @@ impl<W: Write> Engine<W> {
         let mut items = Vec::new();
         let mut out_cols = Vec::new();
         for item in &sel.projection {
-            match item {
-                SelectItem::Expr(Expr::Function { name, args }) => {
+            let SelectItem::Expr(expr) = item else {
+                return Err("unsupported GROUP BY projection".into());
+            };
+            match expr {
+                Expr::Function { name, args } => {
                     let fname = name.to_uppercase();
                     let func = match fname.as_str() {
                         "COUNT" => AggFn::Count,
@@ -628,29 +725,18 @@ impl<W: Write> Engine<W> {
                         if col_name == "*" {
                             None
                         } else {
-                            Some(
-                                schema
-                                    .iter()
-                                    .position(|c| c.name == col_name.as_str())
-                                    .ok_or_else(|| format!("unknown column {col_name}"))?,
-                            )
+                            Some(col_pos(schema, col_name)?)
                         }
                     };
-                    out_cols.push(format!(
-                        "{fname}({})",
-                        if col.is_none() { "*" } else { "c" }
-                    ));
+                    out_cols.push(format_expr(expr));
                     items.push(Item::Agg(Aggregate {
                         label: String::new(),
                         func,
                         col,
                     }));
                 }
-                SelectItem::Expr(Expr::Identifier(id)) => {
-                    let pos = schema
-                        .iter()
-                        .position(|c| c.name == id.as_str())
-                        .ok_or_else(|| format!("unknown column {id}"))?;
+                Expr::Identifier(id) => {
+                    let pos = col_pos(schema, id)?;
                     if !key_idx.contains(&pos) {
                         return Err(format!(
                             "column {id} must appear in GROUP BY or be aggregated",
@@ -665,14 +751,13 @@ impl<W: Write> Engine<W> {
 
         let (_, snap) = self.db.begin();
 
-        // E4b-2: materialize filtered rows, then run Volcano pipeline.
         let mut raw_rows: Vec<Row> = Vec::new();
         for rid in 0..*self.next_row_id.get(table).unwrap_or(&0) {
             let key = row_key(table, rid);
             if let Some(raw) = self.db.get_raw(&key, &snap) {
                 if let Some(full) = decode_row(&raw, schema) {
                     if let Some(pred) = &sel.selection {
-                        if !eval_predicate(pred, schema, &full)? {
+                        if !is_true(&eval_expr(pred, schema, &full)?)? {
                             continue;
                         }
                     }
@@ -717,70 +802,458 @@ impl<W: Write> Engine<W> {
         }
         op = Box::new(Project::new(op, reorder));
 
-        let mut rows = Vec::with_capacity(32);
+        // ORDER BY over the post-aggregation output.
+        if !sel.order_by.is_empty() {
+            let mut positions = Vec::new();
+            let mut desc = Vec::new();
+            for ob in &sel.order_by {
+                let pos = grouped_order_index(&ob.expr, &out_cols)?;
+                positions.push(pos);
+                desc.push(!ob.asc);
+            }
+            let pos2 = positions.clone();
+            op = Box::new(Sort::new(op, desc, move |r: &Row| {
+                Ok(pos2.iter().map(|&p| r[p].clone()).collect())
+            }));
+        }
+
+        if let Some(limit) = sel.limit {
+            op = Box::new(Limit::new(op, limit));
+        }
+
+        let mut out_rows = Vec::with_capacity(32);
         while let Some(r) = op.next()? {
-            rows.push(r);
+            out_rows.push(r);
         }
 
         Ok(ExecResult {
             columns: out_cols,
-            rows,
+            rows: out_rows,
             rows_affected: 0,
         })
     }
 }
 
 // == Expression evaluation ====================================================
+//
+// Three-valued logic (SQL): a predicate is TRUE / FALSE / UNKNOWN (NULL).
+// `is_true` treats UNKNOWN as false for WHERE; `and3`/`or3` follow SQL truth
+// tables. Comparisons involving NULL or mismatched types are UNKNOWN.
 
-fn eval_predicate(pred: &Expr, schema: &[ColumnDef], row: &[SqlValue]) -> Result<bool, String> {
-    match pred {
-        Expr::BinaryOp { left, op, right } if *op == BinOp::And => {
-            Ok(eval_predicate(left, schema, row)? && eval_predicate(right, schema, row)?)
+pub fn col_pos(schema: &[ColumnDef], name: &str) -> Result<usize, String> {
+    schema
+        .iter()
+        .position(|c| c.name == name)
+        .ok_or_else(|| format!("unknown column {name}"))
+}
+
+/// Predicate evaluation for WHERE/JOIN ON: UNKNOWN is treated as false.
+pub fn is_true(v: &SqlValue) -> Result<bool, String> {
+    Ok(to_logic(v)?.unwrap_or(false))
+}
+
+/// SQL boolean coercion: NULL → UNKNOWN (None), INT 0 → false, else true.
+pub fn to_logic(v: &SqlValue) -> Result<Option<bool>, String> {
+    match v {
+        SqlValue::Null => Ok(None),
+        SqlValue::Int(n) => Ok(Some(*n != 0)),
+        SqlValue::Text(_) => Err(format!("boolean predicate expected INTEGER, got {v:?}")),
+    }
+}
+
+fn logic_to_int(b: Option<bool>) -> SqlValue {
+    match b {
+        Some(true) => SqlValue::Int(1),
+        Some(false) => SqlValue::Int(0),
+        None => SqlValue::Null,
+    }
+}
+
+fn and3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
+}
+
+fn or3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
+pub fn eval_expr(expr: &Expr, schema: &[ColumnDef], row: &[SqlValue]) -> Result<SqlValue, String> {
+    match expr {
+        Expr::Identifier(id) => {
+            let pos = col_pos(schema, id)?;
+            row.get(pos)
+                .cloned()
+                .ok_or_else(|| format!("row missing column {id}"))
         }
-        Expr::BinaryOp { left, op, right } => {
-            let lhs = col_value(left, schema, row)?;
-            let rhs = literal_value(right)?;
-            Ok(match op {
-                BinOp::Eq => *lhs == rhs,
-                BinOp::NotEq => *lhs != rhs,
-                BinOp::Lt => compare(lhs, &rhs) == std::cmp::Ordering::Less,
-                BinOp::LtEq => compare(lhs, &rhs) != std::cmp::Ordering::Greater,
-                BinOp::Gt => compare(lhs, &rhs) == std::cmp::Ordering::Greater,
-                BinOp::GtEq => compare(lhs, &rhs) != std::cmp::Ordering::Less,
-                BinOp::And => unreachable!(),
+        Expr::Literal(v) => Ok(v.clone()),
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => match eval_expr(expr, schema, row)? {
+            SqlValue::Int(n) => n
+                .checked_neg()
+                .map(SqlValue::Int)
+                .ok_or("integer overflow in unary -".into()),
+            SqlValue::Null => Ok(SqlValue::Null),
+            other => Err(format!("unary - requires INTEGER, got {other:?}")),
+        },
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => {
+            let v = eval_expr(expr, schema, row)?;
+            Ok(match to_logic(&v)? {
+                Some(b) => SqlValue::Int(if b { 0 } else { 1 }),
+                None => SqlValue::Null,
             })
         }
-        other => Err(format!("unsupported predicate {other:?}")),
+        Expr::Between { expr, lo, hi } => {
+            use std::cmp::Ordering;
+            let v = eval_expr(expr, schema, row)?;
+            let lo = eval_expr(lo, schema, row)?;
+            let hi = eval_expr(hi, schema, row)?;
+            Ok(
+                match (
+                    crate::codec::try_cmp(&v, &lo),
+                    crate::codec::try_cmp(&v, &hi),
+                ) {
+                    (Some(a), Some(b)) => {
+                        SqlValue::Int(if a != Ordering::Less && b != Ordering::Greater {
+                            1
+                        } else {
+                            0
+                        })
+                    }
+                    _ => SqlValue::Null,
+                },
+            )
+        }
+        Expr::InList { expr, list } => {
+            let v = eval_expr(expr, schema, row)?;
+            let mut saw_null = false;
+            for item in list {
+                let iv = eval_expr(item, schema, row)?;
+                if iv == SqlValue::Null {
+                    saw_null = true;
+                } else if iv == v {
+                    return Ok(SqlValue::Int(1));
+                }
+            }
+            Ok(if saw_null {
+                SqlValue::Null
+            } else {
+                SqlValue::Int(0)
+            })
+        }
+        Expr::Function { name, args } => eval_scalar(name, args, schema, row),
+        Expr::BinaryOp { left, op, right } => eval_binary(left, *op, right, schema, row),
     }
 }
 
-fn compare(a: &SqlValue, b: &SqlValue) -> std::cmp::Ordering {
-    match (a, b) {
-        (SqlValue::Int(x), SqlValue::Int(y)) => x.cmp(y),
-        (SqlValue::Text(x), SqlValue::Text(y)) => x.cmp(y),
-        _ => std::cmp::Ordering::Equal,
-    }
-}
-
-fn col_value<'a>(
-    expr: &'a Expr,
+/// Scalar (non-aggregate) function evaluation.
+fn eval_scalar(
+    name: &str,
+    args: &[Expr],
     schema: &[ColumnDef],
-    row: &'a [SqlValue],
-) -> Result<&'a SqlValue, String> {
-    let Expr::Identifier(id) = expr else {
-        return Err("left side of predicate must be a column".into());
-    };
-    let pos = schema
-        .iter()
-        .position(|c| c.name == id.as_str())
-        .ok_or_else(|| format!("unknown column {id}"))?;
-    row.get(pos).ok_or("column index out of range".to_string())
+    row: &[SqlValue],
+) -> Result<SqlValue, String> {
+    let fname = name.to_uppercase();
+    if args.len() != 1 {
+        return Err(format!("{name} expects exactly one argument"));
+    }
+    let v = eval_expr(&args[0], schema, row)?;
+    match fname.as_str() {
+        "UPPER" => match v {
+            SqlValue::Text(s) => Ok(SqlValue::Text(s.to_uppercase())),
+            SqlValue::Null => Ok(SqlValue::Null),
+            other => Err(format!("UPPER expects TEXT, got {other:?}")),
+        },
+        "LOWER" => match v {
+            SqlValue::Text(s) => Ok(SqlValue::Text(s.to_lowercase())),
+            SqlValue::Null => Ok(SqlValue::Null),
+            other => Err(format!("LOWER expects TEXT, got {other:?}")),
+        },
+        "LENGTH" => match v {
+            SqlValue::Text(s) => Ok(SqlValue::Int(s.chars().count() as i64)),
+            SqlValue::Null => Ok(SqlValue::Null),
+            other => Err(format!("LENGTH expects TEXT, got {other:?}")),
+        },
+        other => Err(format!("unsupported function {other}")),
+    }
+}
+
+fn eval_binary(
+    left: &Expr,
+    op: BinOp,
+    right: &Expr,
+    schema: &[ColumnDef],
+    row: &[SqlValue],
+) -> Result<SqlValue, String> {
+    use std::cmp::Ordering;
+    match op {
+        BinOp::And | BinOp::Or => {
+            let a = to_logic(&eval_expr(left, schema, row)?)?;
+            let b = to_logic(&eval_expr(right, schema, row)?)?;
+            let r = if op == BinOp::And {
+                and3(a, b)
+            } else {
+                or3(a, b)
+            };
+            Ok(logic_to_int(r))
+        }
+        BinOp::Like => {
+            let v = eval_expr(left, schema, row)?;
+            let p = eval_expr(right, schema, row)?;
+            Ok(match (v, p) {
+                (SqlValue::Text(s), SqlValue::Text(pat)) => {
+                    SqlValue::Int(if like_matches(&s, &pat) { 1 } else { 0 })
+                }
+                (SqlValue::Null, _) | (_, SqlValue::Null) => SqlValue::Null,
+                _ => return Err("LIKE requires TEXT operands".into()),
+            })
+        }
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+            let a = eval_expr(left, schema, row)?;
+            let b = eval_expr(right, schema, row)?;
+            match (a, b) {
+                (SqlValue::Null, _) | (_, SqlValue::Null) => Ok(SqlValue::Null),
+                (SqlValue::Int(x), SqlValue::Int(y)) => {
+                    let n = match op {
+                        BinOp::Add => x.checked_add(y),
+                        BinOp::Sub => x.checked_sub(y),
+                        BinOp::Mul => x.checked_mul(y),
+                        BinOp::Div => {
+                            if y == 0 {
+                                return Err("division by zero".into());
+                            }
+                            x.checked_div(y)
+                        }
+                        BinOp::Mod => {
+                            if y == 0 {
+                                return Err("division by zero".into());
+                            }
+                            x.checked_rem(y)
+                        }
+                        _ => unreachable!(),
+                    };
+                    n.map(SqlValue::Int)
+                        .ok_or("integer overflow in arithmetic".into())
+                }
+                _ => Err("arithmetic requires INTEGER operands".into()),
+            }
+        }
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
+            let a = eval_expr(left, schema, row)?;
+            let b = eval_expr(right, schema, row)?;
+            let cmp = crate::codec::try_cmp(&a, &b);
+            let truth = match op {
+                BinOp::Eq => cmp.map(|o| o == Ordering::Equal),
+                BinOp::NotEq => cmp.map(|o| o != Ordering::Equal),
+                BinOp::Lt => cmp.map(|o| o == Ordering::Less),
+                BinOp::LtEq => cmp.map(|o| o != Ordering::Greater),
+                BinOp::Gt => cmp.map(|o| o == Ordering::Greater),
+                BinOp::GtEq => cmp.map(|o| o != Ordering::Less),
+                _ => unreachable!(),
+            };
+            Ok(match truth {
+                Some(true) => SqlValue::Int(1),
+                Some(false) => SqlValue::Int(0),
+                None => SqlValue::Null,
+            })
+        }
+    }
+}
+
+/// SQL LIKE matcher with `%` (any run) and `_` (single char), case-sensitive.
+fn like_matches(s: &str, pattern: &str) -> bool {
+    fn helper(s: &[char], p: &[char]) -> bool {
+        match (s, p) {
+            (_, []) => s.is_empty(),
+            (s, ['_', rest @ ..]) => !s.is_empty() && helper(&s[1..], rest),
+            (s, ['%', rest @ ..]) => helper(s, rest) || (!s.is_empty() && helper(&s[1..], p)),
+            ([c, s_rest @ ..], [pc, p_rest @ ..]) => c == pc && helper(s_rest, p_rest),
+            _ => false,
+        }
+    }
+    let s: Vec<char> = s.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    helper(&s, &p)
+}
+
+/// Render an expression back to SQL for result column labels.
+pub fn format_expr(e: &Expr) -> String {
+    match e {
+        Expr::Identifier(id) => id.clone(),
+        Expr::Literal(SqlValue::Int(n)) => n.to_string(),
+        Expr::Literal(SqlValue::Text(s)) => format!("'{s}'"),
+        Expr::Literal(SqlValue::Null) => "NULL".into(),
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => format!("(NOT {})", format_expr(expr)),
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => format!("(-{})", format_expr(expr)),
+        Expr::BinaryOp { left, op, right } => {
+            let sym = match op {
+                BinOp::Eq => "=",
+                BinOp::NotEq => "!=",
+                BinOp::Lt => "<",
+                BinOp::LtEq => "<=",
+                BinOp::Gt => ">",
+                BinOp::GtEq => ">=",
+                BinOp::And => "AND",
+                BinOp::Or => "OR",
+                BinOp::Like => "LIKE",
+                BinOp::Add => "+",
+                BinOp::Sub => "-",
+                BinOp::Mul => "*",
+                BinOp::Div => "/",
+                BinOp::Mod => "%",
+            };
+            format!("({} {sym} {})", format_expr(left), format_expr(right))
+        }
+        Expr::Between { expr, lo, hi } => format!(
+            "({} BETWEEN {} AND {})",
+            format_expr(expr),
+            format_expr(lo),
+            format_expr(hi)
+        ),
+        Expr::InList { expr, list } => {
+            let items: Vec<String> = list.iter().map(format_expr).collect();
+            format!("({} IN ({}))", format_expr(expr), items.join(", "))
+        }
+        Expr::Function { name, args } => {
+            let fname = name.to_uppercase();
+            let rendered: Vec<String> = args.iter().map(format_expr).collect();
+            format!("{fname}({})", rendered.join(", "))
+        }
+    }
+}
+
+/// Resolve a SELECT projection list into per-row expressions + column labels.
+fn projection_specs(
+    sel: &parser::Select,
+    schema: &[ColumnDef],
+) -> Result<(Vec<Expr>, Vec<String>), String> {
+    if sel.projection.len() == 1 && matches!(sel.projection[0], SelectItem::Star) {
+        return Ok((
+            schema
+                .iter()
+                .map(|c| Expr::Identifier(c.name.clone()))
+                .collect(),
+            schema.iter().map(|c| c.name.clone()).collect(),
+        ));
+    }
+    let mut exprs = Vec::new();
+    let mut cols = Vec::new();
+    for item in &sel.projection {
+        let SelectItem::Expr(e) = item else {
+            return Err("unsupported projection".into());
+        };
+        exprs.push(e.clone());
+        cols.push(format_expr(e));
+    }
+    Ok((exprs, cols))
+}
+
+/// Resolve a GROUP BY ORDER BY expression against the post-aggregation
+/// output columns (group keys by name; aggregates by rendered label).
+fn grouped_order_index(e: &Expr, out_cols: &[String]) -> Result<usize, String> {
+    match e {
+        Expr::Identifier(id) => out_cols
+            .iter()
+            .position(|c| c == id)
+            .ok_or_else(|| format!("unknown ORDER BY column {id}")),
+        Expr::Function { .. } => {
+            let label = format_expr(e);
+            out_cols
+                .iter()
+                .position(|c| *c == label)
+                .ok_or_else(|| format!("unknown ORDER BY expression {label}"))
+        }
+        other => Err(format!("unsupported ORDER BY expression {other:?}")),
+    }
 }
 
 fn literal_value(expr: &Expr) -> Result<SqlValue, String> {
     match expr {
         Expr::Literal(v) => Ok(v.clone()),
         other => Err(format!("unsupported literal {other:?}")),
+    }
+}
+
+/// Split a predicate into its top-level AND conjuncts.
+fn conjuncts(expr: &Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            let mut out = conjuncts(left);
+            out.extend(conjuncts(right));
+            out
+        }
+        other => vec![other.clone()],
+    }
+}
+
+/// Rebuild `pred` with the top-level conjunct `term` removed. Returns `None`
+/// only when `term` was the entire predicate.
+fn remove_conjunct(pred: &Expr, term: &Expr) -> Option<Expr> {
+    match pred {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => match (remove_conjunct(left, term), remove_conjunct(right, term)) {
+            (Some(l), Some(r)) => Some(Expr::BinaryOp {
+                left: Box::new(l),
+                op: BinOp::And,
+                right: Box::new(r),
+            }),
+            (Some(l), None) => Some(l),
+            (None, Some(r)) => Some(r),
+            (None, None) => None,
+        },
+        other => {
+            if other == term {
+                None
+            } else {
+                Some(other.clone())
+            }
+        }
+    }
+}
+
+/// Order-preserving key for a single index column: tag + sign-flipped
+/// big-endian INT bytes, or length-prefixed TEXT. Lexicographic key order
+/// matches value order, enabling equality and range scans. NULLs are not
+/// indexed (rows with NULL in the indexed column are invisible to the index).
+fn index_key_encode(v: &SqlValue) -> Result<Vec<u8>, String> {
+    match v {
+        SqlValue::Null => Err("NULL values are not indexed".into()),
+        SqlValue::Int(n) => {
+            let mut key = vec![0u8];
+            key.extend_from_slice(&(*n as u64 ^ (1u64 << 63)).to_be_bytes());
+            Ok(key)
+        }
+        SqlValue::Text(s) => {
+            let mut key = vec![1u8];
+            key.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            key.extend_from_slice(s.as_bytes());
+            Ok(key)
+        }
     }
 }
 
@@ -869,7 +1342,10 @@ fn try_parse_aggregates(
 ) -> Result<Option<Vec<Aggregate>>, String> {
     let mut out = Vec::with_capacity(projection.len());
     for item in projection {
-        let SelectItem::Expr(Expr::Function { name, args }) = item else {
+        let SelectItem::Expr(expr) = item else {
+            return Ok(None);
+        };
+        let Expr::Function { name, args } = expr else {
             return Ok(None);
         };
         let fname = name.to_uppercase();
@@ -890,15 +1366,15 @@ fn try_parse_aggregates(
             if col_name == "*" {
                 None
             } else {
-                let pos = schema
-                    .iter()
-                    .position(|c| c.name == col_name.as_str())
-                    .ok_or_else(|| format!("unknown column {col_name}"))?;
-                Some(pos)
+                Some(col_pos(schema, col_name)?)
             }
         };
-        let label = format!("{fname}({})", if col.is_none() { "*" } else { "c" });
+        let label = format_expr(expr);
         out.push(Aggregate { label, func, col });
+    }
+    if out.is_empty() {
+        // Projection of scalar functions only — not an aggregate query.
+        return Ok(None);
     }
     Ok(Some(out))
 }

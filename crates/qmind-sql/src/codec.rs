@@ -112,6 +112,31 @@ pub fn row_key(table: &str, row_id: u64) -> Vec<u8> {
     format!("{table}\u{1}{row_id:020}").into_bytes()
 }
 
+/// NULL-aware comparison for SQL predicates (three-valued logic). Returns
+/// `None` when either side is NULL or the types are incompatible, i.e. the
+/// predicate result is *unknown*.
+pub fn try_cmp(a: &SqlValue, b: &SqlValue) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (SqlValue::Int(x), SqlValue::Int(y)) => Some(x.cmp(y)),
+        (SqlValue::Text(x), SqlValue::Text(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
+/// Total order over `SqlValue` for ORDER BY sorting.
+/// Ordering: INTEGER < TEXT < NULL (NULLs sort last, PostgreSQL default).
+pub fn total_cmp(a: &SqlValue, b: &SqlValue) -> std::cmp::Ordering {
+    match (a, b) {
+        (SqlValue::Int(x), SqlValue::Int(y)) => x.cmp(y),
+        (SqlValue::Text(x), SqlValue::Text(y)) => x.cmp(y),
+        (SqlValue::Null, SqlValue::Null) => std::cmp::Ordering::Equal,
+        (SqlValue::Null, _) => std::cmp::Ordering::Greater,
+        (_, SqlValue::Null) => std::cmp::Ordering::Less,
+        (SqlValue::Int(_), SqlValue::Text(_)) => std::cmp::Ordering::Less,
+        (SqlValue::Text(_), SqlValue::Int(_)) => std::cmp::Ordering::Greater,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
