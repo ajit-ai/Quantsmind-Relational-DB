@@ -12,7 +12,7 @@
 | **M1** | Storage kernel: pages, buffer pool, B+Tree, WAL (group commit), file store | ✅ done |
 | **M2** | Transactions: MVCC snapshots, recovery replay | ✅ done |
 | **M3** | SQL core: parse → DDL/DML → filter/limit over MVCC | ✅ done |
-| **M4** | Relational: GROUP BY, aggregates, hash INNER JOIN | ✅ done (secondary indexes remaining) |
+| **M4** | Relational: GROUP BY, aggregates, hash INNER JOIN | ✅ done |
 | **M5** | PG wire server + CLI shell (trust auth, simple Query) | 🟡 core done — auth/extended protocol pending |
 | **M6** | Desktop Studio GUI (Tauri 2) | 🟡 shell done — rich UI not yet rewired to Rust engine |
 | **M7** | Production hardening: fuzzing, soak, perf valley, packaging, v0.1.0 | ✅ done |
@@ -21,15 +21,17 @@
 
 ## Current state
 
-- 115 tests green (62 kernel + 6 kernel property + 23 parser + 13 e2e + 4 fuzz + 1 soak + 3 wire + 2 embed + 1 integration).
+- 132 tests green (71 kernel [62 unit + 6 property + 3 integration] + 58 sql [30 unit + 4 fuzz + 1 soak + 23 e2e] + 2 embed + 1 wire).
 - `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` all green on CI (Ubuntu + Windows).
 - Performance measured: B+Tree insert 3.56M elem/s, WAL 2.5M rec/s (release).
 - **Status: Developer Preview / Experimental.** Honest gaps in ARCHITECTURE.md §1.1, §4, §5, §6.
 
 ## Known limitations (documented, not bugs)
 
-- SQL subset: no PRIMARY KEY modifier, no INSERT column-lists, no ORDER BY,
-  no subqueries, no UPDATE/DELETE, no expressions beyond simple predicates.
+- SQL subset: no PRIMARY KEY modifier, no INSERT column-lists, no subqueries,
+  no UPDATE/DELETE.
+- Secondary indexes are single-column and exclude NULL; the planner uses them
+  for equality point lookups (range scans still go through the full scan).
 - JOIN projections are plain columns only (no aggregates over joins, no JOIN+GROUP BY).
 - Single-writer engine mutex; no mult-writer concurrency.
 - Server: trust auth only, no TLS, simple Query only.
@@ -41,7 +43,7 @@
 |---|---|---|---|
 | **P2** | Docs truth reset + license + branding | Product | repo claims match reality; LICENSE present; honest status | ✅ |
 | **P3** | Correctness hardening | Core | property/fuzz for B+Tree, MVCC, WAL; kill-9 chaos; zero committed-txn loss | ✅ |
-| **P4** | Query surface | Core | secondary indexes, ORDER BY/sort, expression engine, richer predicates |
+| **P4** | Query surface | Core | secondary indexes, ORDER BY/sort, expression engine, richer predicates | ✅ |
 | **P5** | Concurrency | Core | snapshot reads lock-free; multi-writer groundwork; read stress tests |
 | **P6** | Server hardening | Product | SCRAM auth, TLS, extended protocol; psql/DBeaver compat tests |
 | **P7** | HTAP perf contract | Perf | vectorized scans ≥50M rows/s; TPC-H Q1/Q6 ≤5× DuckDB; 72h soak |
@@ -136,4 +138,37 @@ would have silently broken `get_all`. The split now lets such a leaf overfill
 instead; a new unit regression test pins the behavior.
 
 `cargo test --workspace` green (115), `cargo fmt --check` and
+`cargo clippy -D warnings` green.
+
+### P4 — Query surface ✅
+Shipped as one commit covering three work-streams: **P4a** expression engine +
+richer predicates, **P4b** ORDER BY/sort, **P4c** secondary indexes.
+
+- **Expression engine**: nested arithmetic (`+ - * / %`) with overflow and
+  division-by-zero errors, three-valued logic (SQL NULL: AND/OR/NOT/KNOWN, 3VL
+  comparisons via `try_cmp`), complete precedence  (OR < AND < comparison <
+  additive < multiplicative < unary, prefix `NOT`, parens).
+- **Richer predicates**: col-vs-col comparisons, `LIKE` (`%`/`_`, case-sensitive),
+  `IN (…)` list with NULL semantics, `BETWEEN … AND …`, case-insensitive
+  keywords, negation forms `NOT a = 1`, `a NOT LIKE b`, `a NOT IN (…)`,
+  `a NOT BETWEEN x AND y`.
+- **Scalar functions**: `UPPER`, `LOWER`, `LENGTH`; expressions are legal in
+  projections and ORDER BY (e.g. `SELECT a + 1 FROM t ORDER BY a * 2`).
+- **ORDER BY/sort**: `Sort` executor operator (stable, materializing), PG null
+  semantics (NULL largest → ASC nulls-last, DESC nulls-first), multiple keys,
+  ORDER BY with LIMIT, on the row path, columnar path, JOINs, and behind GROUP BY
+  (resolved against post-aggregation output columns).
+- **Secondary indexes**: in-memory per-table index trees over the kernel B+Tree;
+  `CREATE INDEX idx ON t (col)` / `DROP INDEX idx`; single-column, NULL-excluded;
+  backfilled at CREATE from existing rows, maintained on every INSERT. The
+  planner serves `col = literal` point lookups from the index (leaving the rest
+  of the WHERE clause as a residual filter); range predicates still full-scan by
+  design. Zero-runtime-dep: index keys use order-preserving encoding
+  (sign-flipped big-endian INT / length-prefixed TEXT).
+- Anecdote enforced by tests: 4 new e2e index tests (backfill + lookup, insert
+  maintenance + NULL skipping, residual-predicate filtering, DDL errors/drop),
+  6 new query-surface e2e tests, 1 new executor unit test (sort null ordering),
+  6 new parser unit tests.
+
+`cargo test --workspace` green (132), `cargo fmt --check` and
 `cargo clippy -D warnings` green.

@@ -60,7 +60,8 @@ desktop GUI studio and Postgres-wire-compatible server mode.
 ├───────────────────────────────────────────────────────────────┤
 │ SQL layer               [qmind-sql]                           │
 │   handwritten parser → SQL subset AST → Volcano executor      │
-│   DDL/DML/SELECT · filter · project · joins · aggregates      │
+│   DDL/DML/SELECT · filter · project · expressions · ORDER BY │
+│   joins · aggregates · secondary indexes                      │
 │   OLTP row path + columnar OLAP read path (M9 integration)    │
 ├───────────────────────────────────────────────────────────────┤
 │ Model layer
@@ -87,8 +88,12 @@ desktop GUI studio and Postgres-wire-compatible server mode.
   acting as the row heap. **Implemented.**
 - B+Tree: insert/get/get_all/range-scan, run-preserving splits, duplicate
   `(key,value)` ordering, differential test vs `BTreeMap`. **Implemented.**
-- **Secondary indexes: Planned (not built).** No latch crabbing yet — SQL
-  requests serialize on an engine mutex (single writer; see §5).
+- **Secondary indexes: Implemented (P4c).** Per-table in-memory index trees over
+  the same kernel B+Tree; single-column, NULL-excluded. `CREATE INDEX`/
+  `DROP INDEX` DDL, backfill at create, maintenance on INSERT, and planner
+  serving `col = literal` equality point-lookups (residual WHERE remains a
+  filter). Range lookups and NULL entries are not indexed; SQL requests still
+  serialize on an engine mutex (single writer; see §5).
 
 ### 3.3 WAL & recovery (M1–M2)
 - CRC-checksummed WAL frames, **group commit** (one syscall per group),
@@ -116,16 +121,26 @@ desktop GUI studio and Postgres-wire-compatible server mode.
 ## 4. SQL layer (Implemented; scope is a strict subset)
 
 - **Parser: handwritten** tokenizer + recursive-descent parser (decision
-  superseded the earlier sqlparser-rs plan). Covers: CREATE TABLE, INSERT
-  (multi-row VALUES), SELECT with projection/filter/GROUP BY/LIMIT, INNER JOIN,
-  SHOW TABLES. No column-lists in INSERT, no PRIMARY KEY modifier, no ORDER BY,
+  superseded the earlier sqlparser-rs plan). Covers: CREATE TABLE, CREATE/DROP
+  INDEX, INSERT (multi-row VALUES), SELECT with projection/expression/filter/
+  GROUP BY/LIMIT/ORDER BY, INNER JOIN, SHOW TABLES. Full expression grammar
+  (arithmetic, comparisons, AND/OR/NOT, LIKE/IN/BETWEEN, scalar functions),
+  case-insensitive keywords. No column-lists in INSERT, no PRIMARY KEY modifier,
   no subqueries, no UPDATE/DELETE yet. **Implemented.**
 - **Executor: Volcano-style** (pull-based) over materialized row batches;
-  scan/filter/project/limit/join/aggregate operators. **Not** SIMD-vectorized —
+  scan/filter/project/sort/limit/join/aggregate operators. **Not** SIMD-vectorized —
   `BATCH_ROWS = 2048` is a batch constant, not a vectorized layout.
-- **Planner: direct plan-lite** — no optimizer rules, no cost model. Joins are
-  hash-style INNER JOIN; JOIN projections are plain columns only (no aggregates
-  over joins, no JOIN+GROUP BY — documented limitation).
+- **Expressions**: `eval_expr` evaluates a full expression tree against a row
+  with three-valued logic (SQL NULL); LIKE (`%`/`_`), IN-lists, BETWEEN,
+  `UPPER`/`LOWER`/`LENGTH`. Arity-safe: type/division-by-zero errors bubble up.
+- **Sort (P4b)**: stable materializing `Sort` with PostgreSQL null semantics
+  (NULL largest → ASC nulls-last, DESC nulls-first); multi-key; applied after
+  GROUP BY against the post-aggregation output.
+- **Planner: direct plan-lite** — no optimizer rules, no cost model. One
+  exception (P4c): a secondary index is chosen for top-level `col = literal`
+  equality conjuncts on the row path. Joins are hash-style INNER JOIN; JOIN
+  projections are plain columns only (no aggregates over joins, no JOIN+GROUP BY
+  — documented limitation).
 - Dialect aim: Postgres-compatible surface syntax (subset), per D-004.
 
 ## 5. Concurrency model (honest)
@@ -155,7 +170,7 @@ desktop GUI studio and Postgres-wire-compatible server mode.
 | Kernel units | unit tests + CRC/format roundtrips (62 tests) | Implemented |
 | Property/fuzz | deterministic differential harness: B+Tree vs oracle (4K ops), WAL every-byte truncation + 400 byte-flip corruptions, MVCC serial-history (1200 steps), 300-txn crash→recovery zero-loss (6 tests) | Implemented |
 | Recovery | restart round-trip / committed-state reconstruction tests | Implemented |
-| SQL semantics | e2e tests: DDL/DML/filter/project/join/aggregate/columnar | Implemented |
+| SQL semantics | 23 e2e tests: DDL/DML/filter/project/expression/order-by/join/aggregate/columnar/secondary-index | Implemented |
 | Parser robustness | handwritten fuzz harness (8K inputs) | Implemented |
 | Soak | 10K-row lifecycle test | Implemented |
 | Perf | criterion benches (`kernel_bench`, `sql_bench`) | Implemented (run manually; bench-compile gated in CI) |

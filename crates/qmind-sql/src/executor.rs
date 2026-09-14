@@ -144,6 +144,72 @@ impl Operator for Limit {
     }
 }
 
+/// Materializing ORDER BY sort. Keys are computed per-row by the caller's
+/// closure (keeps the operator AST-free). Stable. NULLs sort as the largest
+/// value, so ascending puts them last.
+pub struct Sort<F>
+where
+    F: FnMut(&Row) -> Result<Vec<SqlValue>, String>,
+{
+    input: Box<dyn Operator>,
+    key_fn: F,
+    desc: Vec<bool>,
+    rows: Option<std::vec::IntoIter<Row>>,
+}
+
+impl<F> Sort<F>
+where
+    F: FnMut(&Row) -> Result<Vec<SqlValue>, String>,
+{
+    pub fn new(input: Box<dyn Operator>, desc: Vec<bool>, key_fn: F) -> Self {
+        Self {
+            input,
+            key_fn,
+            desc,
+            rows: None,
+        }
+    }
+
+    fn materialize(&mut self) -> Result<(), String> {
+        let mut keyed: Vec<(Vec<SqlValue>, Row)> = Vec::new();
+        while let Some(r) = self.input.next()? {
+            let keys = (self.key_fn)(&r)?;
+            keyed.push((keys, r));
+        }
+        keyed.sort_by(|a, b| sort_key_cmp(&a.0, &b.0, &self.desc));
+        let sorted: Vec<Row> = keyed.into_iter().map(|(_, r)| r).collect();
+        self.rows = Some(sorted.into_iter());
+        Ok(())
+    }
+}
+
+fn sort_key_cmp(a: &[SqlValue], b: &[SqlValue], desc: &[bool]) -> std::cmp::Ordering {
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        let ord = crate::codec::total_cmp(x, y);
+        let ord = if desc.get(i).copied().unwrap_or(false) {
+            ord.reverse()
+        } else {
+            ord
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+impl<F> Operator for Sort<F>
+where
+    F: FnMut(&Row) -> Result<Vec<SqlValue>, String>,
+{
+    fn next(&mut self) -> Result<Option<Row>, String> {
+        if self.rows.is_none() {
+            self.materialize()?;
+        }
+        Ok(self.rows.as_mut().unwrap().next())
+    }
+}
+
 /// Build-side hash join: materializes the RIGHT child, probes with LEFT.
 pub struct HashJoin {
     left: Box<dyn Operator>,
@@ -374,6 +440,38 @@ mod tests {
         assert_eq!(op.next()?, Some(vec![SqlValue::Int(1)]));
         assert_eq!(op.next()?, Some(vec![SqlValue::Int(2)]));
         assert_eq!(op.next()?, Some(vec![SqlValue::Int(3)]));
+        assert_eq!(op.next()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn sort_orders_asc_desc_and_null_last() -> Result<(), String> {
+        let rows: Vec<Row> = vec![
+            vec![SqlValue::Int(3)],
+            vec![SqlValue::Int(1)],
+            vec![SqlValue::Null],
+            vec![SqlValue::Int(2)],
+        ];
+        // ASC: NULLs are largest → last.
+        let mut op = Sort::new(
+            Box::new(VecScan::new(rows.clone())),
+            vec![false],
+            |r: &Row| Ok(vec![r[0].clone()]),
+        );
+        assert_eq!(op.next()?, Some(vec![SqlValue::Int(1)]));
+        assert_eq!(op.next()?, Some(vec![SqlValue::Int(2)]));
+        assert_eq!(op.next()?, Some(vec![SqlValue::Int(3)]));
+        assert_eq!(op.next()?, Some(vec![SqlValue::Null]));
+        assert_eq!(op.next()?, None);
+
+        // DESC: reversed order, NULLs first (PostgreSQL semantics).
+        let mut op = Sort::new(Box::new(VecScan::new(rows)), vec![true], |r: &Row| {
+            Ok(vec![r[0].clone()])
+        });
+        assert_eq!(op.next()?, Some(vec![SqlValue::Null]));
+        assert_eq!(op.next()?, Some(vec![SqlValue::Int(3)]));
+        assert_eq!(op.next()?, Some(vec![SqlValue::Int(2)]));
+        assert_eq!(op.next()?, Some(vec![SqlValue::Int(1)]));
         assert_eq!(op.next()?, None);
         Ok(())
     }

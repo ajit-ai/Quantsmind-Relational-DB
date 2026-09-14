@@ -18,7 +18,12 @@ pub enum Token {
     RParen,
     Comma,
     Star,
+    Slash,
+    Percent,
     Semicolon,
+    // arithmetic operators
+    Plus,
+    Minus,
     // comparison operators
     Eq,
     NotEq,
@@ -37,6 +42,14 @@ pub enum Statement {
         name: String,
         columns: Vec<Column>,
         if_not_exists: bool,
+    },
+    CreateIndex {
+        name: String,
+        table: String,
+        columns: Vec<String>,
+    },
+    DropIndex {
+        name: String,
     },
     Insert {
         table: String,
@@ -65,7 +78,14 @@ pub struct Select {
     pub from: TableRef,
     pub selection: Option<Expr>,
     pub group_by: Vec<Expr>,
+    pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderBy {
+    pub expr: Expr,
+    pub asc: bool, // false => DESC
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,15 +108,34 @@ pub enum TableRef {
 pub enum Expr {
     Identifier(String),
     Literal(SqlValue),
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
     BinaryOp {
         left: Box<Expr>,
         op: BinOp,
         right: Box<Expr>,
     },
+    Between {
+        expr: Box<Expr>,
+        lo: Box<Expr>,
+        hi: Box<Expr>,
+    },
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+    },
     Function {
         name: String,
         args: Vec<Expr>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Not,
+    Neg,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +147,13 @@ pub enum BinOp {
     Gt,
     GtEq,
     And,
+    Or,
+    Like,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
 }
 
 use crate::codec::SqlValue;
@@ -125,7 +171,16 @@ const KEYWORDS: &[(&str, &str)] = &[
     ("WHERE", "WHERE"),
     ("AND", "AND"),
     ("OR", "OR"),
+    ("NOT", "NOT"),
+    ("LIKE", "LIKE"),
+    ("IN", "IN"),
+    ("BETWEEN", "BETWEEN"),
+    ("ORDER", "ORDER"),
+    ("ASC", "ASC"),
+    ("DESC", "DESC"),
     ("LIMIT", "LIMIT"),
+    ("INDEX", "INDEX"),
+    ("DROP", "DROP"),
     ("JOIN", "JOIN"),
     ("INNER", "INNER"),
     ("ON", "ON"),
@@ -134,7 +189,6 @@ const KEYWORDS: &[(&str, &str)] = &[
     ("SHOW", "SHOW"),
     ("TABLES", "TABLES"),
     ("IF", "IF"),
-    ("NOT", "NOT"),
     ("EXISTS", "EXISTS"),
     ("INTEGER", "INTEGER"),
     ("INT", "INTEGER"),
@@ -173,6 +227,18 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>, String> {
             }
             '*' => {
                 tokens.push(Token::Star);
+                i += 1;
+            }
+            '/' => {
+                tokens.push(Token::Slash);
+                i += 1;
+            }
+            '%' => {
+                tokens.push(Token::Percent);
+                i += 1;
+            }
+            '+' => {
+                tokens.push(Token::Plus);
                 i += 1;
             }
             ';' => {
@@ -240,6 +306,10 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>, String> {
                     n = -n;
                 }
                 tokens.push(Token::Int(n));
+            }
+            '-' => {
+                tokens.push(Token::Minus);
+                i += 1;
             }
             c if c.is_ascii_alphabetic() || c == '_' => {
                 let start = i;
@@ -322,12 +392,44 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<Statement, String> {
         match self.peek() {
-            Token::Keyword("CREATE") => self.parse_create_table(),
+            Token::Keyword("CREATE") => self.parse_create(),
+            Token::Keyword("DROP") => self.parse_drop_index(),
             Token::Keyword("INSERT") => self.parse_insert(),
             Token::Keyword("SELECT") => self.parse_select().map(Statement::Select),
             Token::Keyword("SHOW") => self.parse_show_tables(),
             t => Err(format!("unsupported statement, got {t:?}")),
         }
+    }
+
+    fn parse_create(&mut self) -> Result<Statement, String> {
+        if self.tokens.get(self.pos + 1) == Some(&Token::Keyword("INDEX")) {
+            self.parse_create_index()
+        } else {
+            self.parse_create_table()
+        }
+    }
+
+    fn parse_drop_index(&mut self) -> Result<Statement, String> {
+        self.expect_keyword("DROP")?;
+        self.expect_keyword("INDEX")?;
+        let name = self.expect_ident()?;
+        Ok(Statement::DropIndex { name })
+    }
+
+    fn parse_create_index(&mut self) -> Result<Statement, String> {
+        self.expect_keyword("CREATE")?;
+        self.expect_keyword("INDEX")?;
+        let name = self.expect_ident()?;
+        self.expect_keyword("ON")?;
+        let table = self.expect_ident()?;
+        self.expect_paren_open()?;
+        let columns = self.parse_comma_separated(Self::expect_ident)?;
+        self.expect_paren_close()?;
+        Ok(Statement::CreateIndex {
+            name,
+            table,
+            columns,
+        })
     }
 
     // ── CREATE TABLE ─────────────────────────────────────────────────────
@@ -407,7 +509,7 @@ impl Parser {
         let mut selection = None;
         if self.peek() == &Token::Keyword("WHERE") {
             self.advance();
-            selection = Some(self.parse_and_expr()?);
+            selection = Some(self.parse_expr()?);
         }
 
         let mut group_by = Vec::new();
@@ -415,6 +517,11 @@ impl Parser {
             self.advance();
             self.expect_keyword("BY")?;
             group_by = self.parse_comma_separated(Self::parse_expr)?;
+        }
+
+        let mut order_by = Vec::new();
+        if self.peek() == &Token::Keyword("ORDER") {
+            order_by = self.parse_order_by()?;
         }
 
         let mut limit = None;
@@ -428,7 +535,28 @@ impl Parser {
             from,
             selection,
             group_by,
+            order_by,
             limit,
+        })
+    }
+
+    fn parse_order_by(&mut self) -> Result<Vec<OrderBy>, String> {
+        self.expect_keyword("ORDER")?;
+        self.expect_keyword("BY")?;
+        self.parse_comma_separated(|p| {
+            let expr = p.parse_expr()?;
+            let asc = match p.peek() {
+                Token::Keyword("ASC") => {
+                    p.advance();
+                    true
+                }
+                Token::Keyword("DESC") => {
+                    p.advance();
+                    false
+                }
+                _ => true,
+            };
+            Ok(OrderBy { expr, asc })
         })
     }
 
@@ -502,6 +630,27 @@ impl Parser {
     }
 
     // ── expressions ──────────────────────────────────────────────────────
+    //
+    // Precedence (loosest to tightest):
+    //   OR < AND < comparison / LIKE / IN / BETWEEN < additive < mult < unary
+
+    fn parse_expr(&mut self) -> Result<Expr, String> {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_and_expr()?;
+        while self.peek() == &Token::Keyword("OR") {
+            self.advance();
+            let right = self.parse_and_expr()?;
+            left = Expr::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::Or,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
 
     fn parse_and_expr(&mut self) -> Result<Expr, String> {
         let mut left = self.parse_comparison()?;
@@ -518,7 +667,80 @@ impl Parser {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, String> {
-        let left = self.parse_primary()?;
+        // Prefix NOT binds just looser than a comparison, so
+        // `NOT a = 1` parses as `NOT (a = 1)`.
+        if self.peek() == &Token::Keyword("NOT") {
+            self.advance();
+            let inner = self.parse_comparison()?;
+            return Ok(Expr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(inner),
+            });
+        }
+
+        let mut left = self.parse_additive()?;
+
+        // Postfix: LIKE / IN / BETWEEN, optionally negated (`a NOT LIKE b`).
+        let (post, negated) = if self.peek() == &Token::Keyword("NOT") {
+            match self.tokens.get(self.pos + 1) {
+                Some(Token::Keyword("LIKE" | "IN" | "BETWEEN")) => {
+                    self.advance(); // NOT
+                    let k = match self.advance() {
+                        Token::Keyword(k) => k,
+                        _ => unreachable!(),
+                    };
+                    (Some(k), true)
+                }
+                _ => (None, false),
+            }
+        } else {
+            match self.peek() {
+                Token::Keyword(k @ ("LIKE" | "IN" | "BETWEEN")) => {
+                    let k = *k;
+                    self.advance();
+                    (Some(k), false)
+                }
+                _ => (None, false),
+            }
+        };
+
+        match post {
+            Some("LIKE") => {
+                let right = self.parse_additive()?;
+                left = Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: BinOp::Like,
+                    right: Box::new(right),
+                };
+            }
+            Some("IN") => {
+                self.expect_paren_open()?;
+                let list = self.parse_comma_separated(Self::parse_expr)?;
+                self.expect_paren_close()?;
+                left = Expr::InList {
+                    expr: Box::new(left),
+                    list,
+                };
+            }
+            Some("BETWEEN") => {
+                let lo = self.parse_additive()?;
+                self.expect_keyword("AND")?;
+                let hi = self.parse_additive()?;
+                left = Expr::Between {
+                    expr: Box::new(left),
+                    lo: Box::new(lo),
+                    hi: Box::new(hi),
+                };
+            }
+            _ => {}
+        }
+        if negated {
+            left = Expr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(left),
+            };
+        }
+
         let op = match self.peek() {
             Token::Eq => BinOp::Eq,
             Token::NotEq => BinOp::NotEq,
@@ -529,12 +751,69 @@ impl Parser {
             _ => return Ok(left),
         };
         self.advance();
-        let right = self.parse_primary()?;
+        let right = self.parse_additive()?;
         Ok(Expr::BinaryOp {
             left: Box::new(left),
             op,
             right: Box::new(right),
         })
+    }
+
+    fn parse_additive(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_multiplicative()?;
+        loop {
+            let op = match self.peek() {
+                Token::Plus => BinOp::Add,
+                Token::Minus => BinOp::Sub,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_multiplicative()?;
+            left = Expr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_multiplicative(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_unary()?;
+        loop {
+            let op = match self.peek() {
+                Token::Star => BinOp::Mul,
+                Token::Slash => BinOp::Div,
+                Token::Percent => BinOp::Mod,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_unary()?;
+            left = Expr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_unary(&mut self) -> Result<Expr, String> {
+        if self.peek() == &Token::Minus {
+            self.advance();
+            let expr = self.parse_unary()?;
+            // Fold `-<literal>` into a negative literal so `VALUES (-42)` stays
+            // a plain literal (accepted by INSERT validation).
+            if let Expr::Literal(SqlValue::Int(n)) = expr {
+                let n = n.checked_neg().ok_or("integer overflow in literal")?;
+                return Ok(Expr::Literal(SqlValue::Int(n)));
+            }
+            return Ok(Expr::Unary {
+                op: UnaryOp::Neg,
+                expr: Box::new(expr),
+            });
+        }
+        self.parse_primary()
     }
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
@@ -586,16 +865,12 @@ impl Parser {
             }
             Token::LParen => {
                 self.advance();
-                let e = self.parse_and_expr()?;
+                let e = self.parse_expr()?;
                 self.expect_paren_close()?;
                 Ok(e)
             }
             t => Err(format!("unexpected token in expression: {t:?}")),
         }
-    }
-
-    fn parse_expr(&mut self) -> Result<Expr, String> {
-        self.parse_and_expr()
     }
 
     // ── helpers ──────────────────────────────────────────────────────────
@@ -814,6 +1089,167 @@ mod tests {
         match &stmts[0] {
             Statement::Select(sel) => assert!(sel.selection.is_some()),
             other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_or_binds_looser_than_and() {
+        let stmts = Parser::parse("SELECT * FROM t WHERE a = 1 OR a = 2 AND b = 3").unwrap();
+        let Statement::Select(sel) = &stmts[0] else {
+            panic!("expected Select");
+        };
+        // Shape: OR(Eq(a,1), AND(Eq(a,2), Eq(b,3))).
+        let Some(Expr::BinaryOp { op, left, right }) = &sel.selection else {
+            panic!("expected OR at top");
+        };
+        assert_eq!(*op, BinOp::Or);
+        let Expr::BinaryOp { op: eq_left, .. } = left.as_ref() else {
+            panic!("OR left side should be an equality");
+        };
+        assert_eq!(*eq_left, BinOp::Eq);
+        let Expr::BinaryOp { op: and_op, .. } = right.as_ref() else {
+            panic!("right side should be AND");
+        };
+        assert_eq!(*and_op, BinOp::And);
+    }
+
+    #[test]
+    fn parse_not_predicate() {
+        let stmts = Parser::parse("SELECT * FROM t WHERE NOT a = 1").unwrap();
+        let Statement::Select(sel) = &stmts[0] else {
+            panic!("expected Select");
+        };
+        let Some(Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        }) = &sel.selection
+        else {
+            panic!("expected NOT at top");
+        };
+        let Expr::BinaryOp { op: BinOp::Eq, .. } = expr.as_ref() else {
+            panic!("NOT should wrap an equality");
+        };
+    }
+
+    #[test]
+    fn parse_like_in_between_and_negations() {
+        let stmts =
+            Parser::parse("SELECT * FROM t WHERE name LIKE 'A%' AND id IN (1, 2, 3)").unwrap();
+        let Statement::Select(sel) = &stmts[0] else {
+            panic!("expected Select");
+        };
+        let Some(Expr::BinaryOp { op: BinOp::And, .. }) = &sel.selection else {
+            panic!("expected AND");
+        };
+
+        let stmts = Parser::parse("SELECT * FROM t WHERE salary BETWEEN 10 AND 20").unwrap();
+        let Statement::Select(sel) = &stmts[0] else {
+            panic!("expected Select");
+        };
+        let Some(Expr::Between { lo, hi, .. }) = &sel.selection else {
+            panic!("expected BETWEEN");
+        };
+        assert_eq!(lo.as_ref(), &Expr::Literal(SqlValue::Int(10)));
+        assert_eq!(hi.as_ref(), &Expr::Literal(SqlValue::Int(20)));
+
+        let stmts = Parser::parse("SELECT * FROM t WHERE name NOT LIKE 'x%'").unwrap();
+        let Statement::Select(sel) = &stmts[0] else {
+            panic!("expected Select");
+        };
+        let Some(Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        }) = &sel.selection
+        else {
+            panic!("expected NOT wrapping LIKE");
+        };
+        let Expr::BinaryOp {
+            op: BinOp::Like, ..
+        } = expr.as_ref()
+        else {
+            panic!("expected LIKE");
+        };
+
+        let stmts = Parser::parse("SELECT * FROM t WHERE id NOT BETWEEN 1 AND 5").unwrap();
+        let Statement::Select(sel) = &stmts[0] else {
+            panic!("expected Select");
+        };
+        let Some(Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        }) = &sel.selection
+        else {
+            panic!("expected NOT wrapping BETWEEN");
+        };
+        let Expr::Between { .. } = expr.as_ref() else {
+            panic!("expected BETWEEN");
+        };
+    }
+
+    #[test]
+    fn parse_arithmetic_precedence() {
+        let stmts = Parser::parse("SELECT a + b * 2 FROM t WHERE a - 1 = 5").unwrap();
+        let Statement::Select(sel) = &stmts[0] else {
+            panic!("expected Select");
+        };
+        // Projection `a + b * 2`: Add(Identifier(a), Mul(Identifier(b), 2))
+        let SelectItem::Expr(Expr::BinaryOp {
+            op: plus, right, ..
+        }) = &sel.projection[0]
+        else {
+            panic!("expected additive projection");
+        };
+        assert_eq!(*plus, BinOp::Add);
+        let Expr::BinaryOp { op: mul, .. } = right.as_ref() else {
+            panic!("* binds tighter than +");
+        };
+        assert_eq!(*mul, BinOp::Mul);
+
+        // WHERE `a - 1 = 5`: Eq(Sub(a, 1), 5)
+        let Some(Expr::BinaryOp { op: eq, left, .. }) = &sel.selection else {
+            panic!("expected comparison");
+        };
+        assert_eq!(*eq, BinOp::Eq);
+        let Expr::BinaryOp { op: sub, .. } = left.as_ref() else {
+            panic!("expected Sub on left");
+        };
+        assert_eq!(*sub, BinOp::Sub);
+    }
+
+    #[test]
+    fn parse_order_by() {
+        let stmts = Parser::parse("SELECT a, b FROM t ORDER BY b DESC, a").unwrap();
+        let Statement::Select(sel) = &stmts[0] else {
+            panic!("expected Select");
+        };
+        assert_eq!(sel.order_by.len(), 2);
+        assert!(!sel.order_by[0].asc);
+        assert!(sel.order_by[1].asc);
+        assert!(matches!(
+            &sel.order_by[0].expr,
+            Expr::Identifier(n) if n == "b"
+        ));
+    }
+
+    #[test]
+    fn parse_create_and_drop_index() {
+        let stmts = Parser::parse("CREATE INDEX idx_name ON users (name)").unwrap();
+        match &stmts[0] {
+            Statement::CreateIndex {
+                name,
+                table,
+                columns,
+            } => {
+                assert_eq!(name, "idx_name");
+                assert_eq!(table, "users");
+                assert_eq!(columns, &vec!["name".to_string()]);
+            }
+            other => panic!("expected CreateIndex, got {other:?}"),
+        }
+        let stmts = Parser::parse("DROP INDEX idx_name").unwrap();
+        match &stmts[0] {
+            Statement::DropIndex { name } => assert_eq!(name, "idx_name"),
+            other => panic!("expected DropIndex, got {other:?}"),
         }
     }
 

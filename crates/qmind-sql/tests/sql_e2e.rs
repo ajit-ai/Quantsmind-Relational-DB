@@ -218,6 +218,277 @@ fn show_tables_lists_created_tables() {
     );
 }
 
+// ── P4: expression engine — richer predicates ──────────────────────────────
+
+#[test]
+fn arithmetic_expression_predicates_and_projection() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE t (a INTEGER, b INTEGER)")
+        .unwrap();
+    for i in 0..10i64 {
+        eng.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 3))
+            .unwrap();
+    }
+
+    // Column-to-column comparison.
+    let r = eng.execute("SELECT a FROM t WHERE b = a * 3").unwrap();
+    assert_eq!(r.rows.len(), 10);
+
+    // Arithmetic + modulo in predicates and projections.
+    let r = eng
+        .execute("SELECT a + 1, a * 2 FROM t WHERE a % 2 = 0 ORDER BY a LIMIT 3")
+        .unwrap();
+    assert_eq!(r.columns, vec!["(a + 1)", "(a * 2)"]);
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Int(1), SqlValue::Int(0)],
+            vec![SqlValue::Int(3), SqlValue::Int(4)],
+            vec![SqlValue::Int(5), SqlValue::Int(8)],
+        ]
+    );
+
+    // Division by zero is an error, not a silent result.
+    assert!(eng.execute("SELECT a / 0 FROM t").is_err());
+}
+
+#[test]
+fn or_not_and_null_three_valued_logic() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE t (id INTEGER, name TEXT)")
+        .unwrap();
+    eng.execute("INSERT INTO t VALUES (1, 'Ada'), (2, 'Grace'), (3, NULL), (4, 'Linus')")
+        .unwrap();
+
+    // OR + parentheses.
+    let r = eng
+        .execute("SELECT id FROM t WHERE name = 'Ada' OR (id = 2 AND name = 'Grace')")
+        .unwrap();
+    assert_eq!(r.rows, vec![vec![SqlValue::Int(1)], vec![SqlValue::Int(2)]]);
+
+    // NOT wraps the whole comparison.
+    let r = eng.execute("SELECT id FROM t WHERE NOT id = 4").unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Int(1)],
+            vec![SqlValue::Int(2)],
+            vec![SqlValue::Int(3)]
+        ]
+    );
+
+    // NULL comparisons never match.
+    assert_eq!(
+        eng.execute("SELECT id FROM t WHERE name = NULL")
+            .unwrap()
+            .rows
+            .len(),
+        0
+    );
+    assert_eq!(
+        eng.execute("SELECT id FROM t WHERE name != NULL")
+            .unwrap()
+            .rows
+            .len(),
+        0
+    );
+    // NULL only matches IS-agnostic * ? (no: NULL = NULL is unknown too).
+    assert_eq!(
+        eng.execute("SELECT id FROM t WHERE id = NULL")
+            .unwrap()
+            .rows
+            .len(),
+        0
+    );
+
+    // Scalar functions.
+    let r = eng
+        .execute("SELECT UPPER(name), LENGTH(name) FROM t WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![vec![SqlValue::Text("ADA".into()), SqlValue::Int(3)]]
+    );
+}
+
+#[test]
+fn like_in_between_predicates() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE t (name TEXT, score INTEGER)")
+        .unwrap();
+    let names = ["Alice", "Bob", "Carol", "alice", "Dan", "Dave"];
+    for (i, n) in names.iter().enumerate() {
+        eng.execute(&format!(
+            "INSERT INTO t VALUES ('{n}', {})",
+            (i as i64) * 10
+        ))
+        .unwrap();
+    }
+
+    let r = eng
+        .execute("SELECT name FROM t WHERE name LIKE 'A%' ORDER BY name")
+        .unwrap();
+    assert_eq!(r.rows, vec![vec![SqlValue::Text("Alice".into())]]);
+    // LIKE is case-sensitive.
+    assert_eq!(
+        eng.execute("SELECT name FROM t WHERE name LIKE 'a%'")
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+
+    // IN list.
+    let r = eng
+        .execute("SELECT name FROM t WHERE name IN ('Bob', 'Dave') ORDER BY name")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Text("Bob".into())],
+            vec![SqlValue::Text("Dave".into())]
+        ]
+    );
+
+    let r = eng.execute("SELECT name FROM t WHERE name NOT IN ('Bob', 'Dave') AND name IN ('Alice', 'Carol') ORDER BY name").unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Text("Alice".into())],
+            vec![SqlValue::Text("Carol".into())]
+        ]
+    );
+
+    // BETWEEN is inclusive.
+    let r = eng
+        .execute("SELECT name FROM t WHERE score BETWEEN 20 AND 40")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Text("Carol".into())],
+            vec![SqlValue::Text("alice".into())],
+            vec![SqlValue::Text("Dan".into())],
+        ]
+    );
+}
+
+// ── P4: ORDER BY / sort ────────────────────────────────────────────────────
+
+#[test]
+fn order_by_asc_desc_multiple_keys_and_null_last() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE t (k INTEGER, v TEXT)").unwrap();
+    eng.execute("INSERT INTO t VALUES (2, 'b'), (1, 'a'), (3, 'c'), (2, 'a'), (NULL, 'n')")
+        .unwrap();
+
+    let r = eng.execute("SELECT k FROM t ORDER BY k").unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Int(1)],
+            vec![SqlValue::Int(2)],
+            vec![SqlValue::Int(2)],
+            vec![SqlValue::Int(3)],
+            vec![SqlValue::Null],
+        ]
+    );
+
+    let r = eng.execute("SELECT k FROM t ORDER BY k DESC").unwrap();
+    assert_eq!(r.rows[0], vec![SqlValue::Null]);
+    assert_eq!(r.rows[1], vec![SqlValue::Int(3)]);
+
+    // Multiple keys: k DESC, then v ASC within ties (stable).
+    let r = eng
+        .execute("SELECT k, v FROM t WHERE k < 100 ORDER BY k DESC, v")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Int(3), SqlValue::Text("c".into())],
+            vec![SqlValue::Int(2), SqlValue::Text("a".into())],
+            vec![SqlValue::Int(2), SqlValue::Text("b".into())],
+            vec![SqlValue::Int(1), SqlValue::Text("a".into())],
+        ]
+    );
+
+    // ORDER BY over an expression.
+    let r = eng.execute("SELECT k FROM t ORDER BY k * -1").unwrap();
+    assert_eq!(r.rows[0], vec![SqlValue::Int(3)]);
+}
+
+#[test]
+fn order_by_with_limit_and_on_joins_and_group_by() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE a (id INTEGER, val TEXT)")
+        .unwrap();
+    eng.execute("CREATE TABLE b (cid INTEGER, amt INTEGER)")
+        .unwrap();
+    eng.execute("INSERT INTO a VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .unwrap();
+    eng.execute("INSERT INTO b VALUES (1, 100), (2, 50), (3, 200)")
+        .unwrap();
+
+    let r = eng
+        .execute("SELECT val FROM a INNER JOIN b ON id = cid ORDER BY amt")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Text("two".into())],
+            vec![SqlValue::Text("one".into())],
+            vec![SqlValue::Text("three".into())],
+        ]
+    );
+
+    let r = eng
+        .execute("SELECT val FROM a ORDER BY val DESC LIMIT 2")
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Text("two".into())],
+            vec![SqlValue::Text("three".into())]
+        ]
+    );
+
+    let r = eng
+        .execute("SELECT val, COUNT(*) FROM a GROUP BY val ORDER BY COUNT(*) DESC, val")
+        .unwrap();
+    assert_eq!(r.rows.len(), 3);
+    assert_eq!(r.columns, vec!["val", "COUNT(*)"]);
+}
+
+#[test]
+fn order_by_pulls_from_columnar_path() {
+    let dir = std::env::temp_dir().join("qmind_e2e_order_by");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut eng = Engine::new(Vec::new()).with_columnar(dir.clone());
+    eng.execute("CREATE TABLE t (id INTEGER NOT NULL, v TEXT)")
+        .unwrap();
+    for i in 0..5i64 {
+        eng.execute(&format!("INSERT INTO t VALUES ({i}, 'v{}')", 4 - i))
+            .unwrap();
+    }
+    eng.flush_to_columnar().unwrap();
+
+    let r = eng.execute("SELECT id FROM t ORDER BY id DESC").unwrap();
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![SqlValue::Int(4)],
+            vec![SqlValue::Int(3)],
+            vec![SqlValue::Int(2)],
+            vec![SqlValue::Int(1)],
+            vec![SqlValue::Int(0)],
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── M9: Columnar HTAP integration ──────────────────────────────────────────
 
 #[test]
@@ -332,4 +603,135 @@ fn columnar_htap_multiple_flushes_concatenate() {
     assert_eq!(r.rows.len(), 5);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── P4: Secondary indexes ─────────────────────────────────────────────────
+
+#[test]
+fn create_index_backfill_and_equality_lookup() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE accounts (id INTEGER NOT NULL, city TEXT)")
+        .unwrap();
+
+    // Seed rows, then build the index (backfill over existing data).
+    for (id, city) in [(1i64, "London"), (2, "Paris"), (3, "Tokyo"), (4, "London")] {
+        eng.execute(&format!("INSERT INTO accounts VALUES ({id}, '{city}')"))
+            .unwrap();
+    }
+    eng.execute("CREATE INDEX idx_city ON accounts (city)")
+        .unwrap();
+
+    // Point query on the indexed column.
+    let r = eng
+        .execute("SELECT id FROM accounts WHERE city = 'London'")
+        .unwrap();
+    let mut ids: Vec<_> = r.rows.into_iter().map(|row| row[0].clone()).collect();
+    ids.sort();
+    assert_eq!(ids, vec![SqlValue::Int(1), SqlValue::Int(4)]);
+
+    // Indexed INTEGER equality.
+    let r = eng.execute("SELECT id FROM accounts WHERE id = 3").unwrap();
+    assert_eq!(r.rows, vec![vec![SqlValue::Int(3)]]);
+}
+
+#[test]
+fn index_maintained_on_insert_and_null_skipped() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE events (eid INTEGER NOT NULL, host TEXT)")
+        .unwrap();
+    eng.execute("INSERT INTO events VALUES (1, 'alpha')")
+        .unwrap();
+    eng.execute("CREATE INDEX idx_host ON events (host)")
+        .unwrap();
+
+    // New inserts must appear in index-driven lookups.
+    eng.execute("INSERT INTO events VALUES (2, 'beta'), (3, 'alpha')")
+        .unwrap();
+
+    let r = eng
+        .execute("SELECT eid FROM events WHERE host = 'alpha'")
+        .unwrap();
+    let mut ids: Vec<_> = r.rows.into_iter().map(|row| row[0].clone()).collect();
+    ids.sort();
+    assert_eq!(ids, vec![SqlValue::Int(1), SqlValue::Int(3)]);
+
+    // NULL indexed values are skipped: the NULL row exists but never
+    // participates in index lookups (and `host = NULL` is NULL, so no rows).
+    eng.execute("INSERT INTO events VALUES (4, NULL)").unwrap();
+    assert_eq!(eng.execute("SELECT * FROM events").unwrap().rows.len(), 4);
+    let r = eng
+        .execute("SELECT eid FROM events WHERE host = 'alpha'")
+        .unwrap();
+    assert_eq!(r.rows.len(), 2);
+    assert!(eng
+        .execute("SELECT eid FROM events WHERE host = NULL")
+        .unwrap()
+        .rows
+        .is_empty());
+}
+
+#[test]
+fn index_equality_plus_residual_predicate() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE orders (oid INTEGER NOT NULL, cust TEXT)")
+        .unwrap();
+    for (oid, cust) in [(1i64, "ada"), (2, "bob"), (3, "ada"), (4, "ada")] {
+        eng.execute(&format!("INSERT INTO orders VALUES ({oid}, '{cust}')"))
+            .unwrap();
+    }
+    eng.execute("CREATE INDEX idx_cust ON orders (cust)")
+        .unwrap();
+
+    // Index serves `cust = 'ada'`; the remaining conjunct must still filter.
+    let r = eng
+        .execute("SELECT oid FROM orders WHERE cust = 'ada' AND oid > 1")
+        .unwrap();
+    let mut ids: Vec<_> = r.rows.into_iter().map(|row| row[0].clone()).collect();
+    ids.sort();
+    assert_eq!(ids, vec![SqlValue::Int(3), SqlValue::Int(4)]);
+
+    // Range predicates don't use the index but must still match the same rows.
+    let r = eng
+        .execute("SELECT oid FROM orders WHERE cust >= 'ada' AND cust <= 'ada'")
+        .unwrap();
+    let mut ids: Vec<_> = r.rows.into_iter().map(|row| row[0].clone()).collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![SqlValue::Int(1), SqlValue::Int(3), SqlValue::Int(4)]
+    );
+}
+
+#[test]
+fn create_index_errors_and_drop_index() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE a (x INTEGER)").unwrap();
+    eng.execute("CREATE TABLE b (y TEXT)").unwrap();
+
+    assert!(eng
+        .execute("CREATE INDEX i ON missing (x)")
+        .unwrap_err()
+        .contains("no table"));
+
+    assert!(eng
+        .execute("CREATE INDEX i ON a (x, y)")
+        .unwrap_err()
+        .contains("single-column"));
+
+    eng.execute("CREATE INDEX i ON a (x)").unwrap();
+    assert!(eng
+        .execute("CREATE INDEX i ON a (x)")
+        .unwrap_err()
+        .contains("already exists"));
+
+    // Drop removes the index (subsequent DROP errors).
+    eng.execute("DROP INDEX i").unwrap();
+    assert!(eng
+        .execute("DROP INDEX i")
+        .unwrap_err()
+        .contains("no index"));
+
+    // Old error-message stubs are gone: CREATE/DROP are real features now.
+    assert!(eng.execute("CREATE INDEX j ON a (x)").is_ok());
+    eng.execute("DROP INDEX j").unwrap();
 }

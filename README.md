@@ -535,15 +535,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 | Suite | Count | Scope |
 |---|---|---|
-| Kernel unit | 61 | Pages, buffer pool, B+Tree, WAL, MVCC, locks, recovery, eviction, file store, columnar (M8) |
-| SQL e2e | 13 | DDL, DML, WHERE, LIMIT, JOIN, GROUP BY, aggregates, columnar HTAP (M9) |
-| SQL parser | 23 | Tokenizer, AST, case-insensitivity, strings, expressions |
+| Kernel unit | 62 | Pages, buffer pool, B+Tree, WAL, MVCC, locks, recovery, eviction, file store, columnar (M8) |
+| Kernel property/fuzz | 6 | Differential B+Tree, WAL truncation/corruption, MVCC serial history, crash→recovery zero-loss |
+| Kernel integration | 3 | Cross-store roundtrip |
+| SQL e2e | 23 | DDL, DML, WHERE, expressions, ORDER BY, LIMIT, JOIN, GROUP BY, aggregates, columnar HTAP (M9), secondary indexes (P4) |
+| SQL unit (parser/codec/executor) | 30 | Tokenizer, AST, case-insensitivity, strings, expression grammar, sort null-ordering, operators |
 | Parser fuzz | 4 | 8K random inputs, no panics |
 | Soak test | 1 | 10K row lifecycle across multiple tables |
-| Wire protocol | 3 | TCP e2e (multi-client, shared engine) |
+| Wire protocol | 1 | TCP e2e (simple Query) |
 | Embedded API | 2 | JSON API contract |
-| Kernel integration | 1 | Cross-store roundtrip |
-| **Total** | **108** | **All green, clippy clean** |
+| **Total** | **132** | **All green, clippy clean** |
 
 ---
 
