@@ -13,6 +13,10 @@ qmind-kernel = { workspace = true }
 [dev-dependencies]
 criterion = { version = "0.5", features = ["cargo_bench_support"] }
 
+[[bin]]
+name = "qmind-persistence-fixture"
+path = "src/bin/qmind-persistence-fixture.rs"
+
 [[bench]]
 name = "sql_bench"
 harness = false

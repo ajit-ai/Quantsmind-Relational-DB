@@ -23,6 +23,17 @@ pub enum Error {
         at: Lsn,
         reason: String,
     },
+    /// On-disk format or metadata version is not one this build understands.
+    UnsupportedFormat {
+        entity: &'static str,
+        found: u32,
+        expected: u32,
+    },
+    /// Persistent catalog state could not be validated during open/recovery.
+    CatalogCorrupt {
+        table: String,
+        reason: String,
+    },
     /// Every frame is pinned or referenced — pool capacity exhausted.
     NoEvictableFrame,
     Io(std::io::Error),
@@ -37,6 +48,17 @@ impl fmt::Display for Error {
             Error::WalGap { at } => write!(f, "gap in WAL at LSN {at}"),
             Error::WalCorrupt { at, reason } => {
                 write!(f, "corrupt WAL record at LSN {at}: {reason}")
+            }
+            Error::UnsupportedFormat {
+                entity,
+                found,
+                expected,
+            } => write!(
+                f,
+                "unsupported {entity} format version {found} (this build supports {expected})"
+            ),
+            Error::CatalogCorrupt { table, reason } => {
+                write!(f, "catalog corrupt for table `{table}`: {reason}")
             }
             Error::NoEvictableFrame => write!(f, "buffer pool exhausted: all frames pinned"),
             Error::Io(e) => write!(f, "io error: {e}"),

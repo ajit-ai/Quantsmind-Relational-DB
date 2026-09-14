@@ -17,7 +17,8 @@ use crate::parser::{self, BinOp, DataType, Expr, SelectItem, Statement, TableRef
 use qmind_kernel::column_delta::{ColumnDataType, ColumnInfo, DeltaApplier, TableSchema};
 use qmind_kernel::column_reader::ColumnarReader;
 use qmind_kernel::columnar::ColValue;
-use qmind_kernel::{BTree, MvccStore, Snapshot, WalWriter};
+use qmind_kernel::wal::{CatalogColumn, ColumnKind};
+use qmind_kernel::{BTree, Error as KError, MvccStore, Snapshot, WalRecord, WalWriter};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -240,6 +241,16 @@ impl<W: Write> Engine<W> {
                 nullable: !col.not_null,
             });
         }
+        // R2.4/2.8: DDL is autocommit — the durable WAL record lands (and is
+        // synced) BEFORE the in-memory catalog mutates, so the catalog can be
+        // rebuilt from the log and a crash never leaks a half-made table.
+        self.wal.append(&WalRecord::CreateTable {
+            name: name.to_string(),
+            columns: column_def_to_catalog(&cols),
+        });
+        if let Err(e) = self.wal.commit_group() {
+            return Err(format!("wal failure committing CREATE TABLE: {e:?}"));
+        }
         self.tables.insert(name.to_string(), cols.clone());
         self.next_row_id.entry(name.to_string()).or_insert(0);
         // M9: Register table schema for columnar delta capture.
@@ -270,6 +281,16 @@ impl<W: Write> Engine<W> {
             .ok_or_else(|| format!("no table `{table}`"))?;
         col_pos(&schema, &column)?;
 
+        // Durable autocommit DDL before in-memory registration.
+        self.wal.append(&WalRecord::CreateIndex {
+            name: name.to_string(),
+            table: table.to_string(),
+            column: column.clone(),
+        });
+        if let Err(e) = self.wal.commit_group() {
+            return Err(format!("wal failure committing CREATE INDEX: {e:?}"));
+        }
+
         // Backfill from existing rows.
         let mut tree = BTree::new();
         let snap = self.db.snapshot();
@@ -294,9 +315,17 @@ impl<W: Write> Engine<W> {
     }
 
     fn drop_index(&mut self, name: &str) -> Result<ExecResult, String> {
-        if self.indexes.remove(name).is_none() {
+        if !self.indexes.contains_key(name) {
             return Err(format!("no index `{name}`"));
         }
+        // Durable autocommit DDL before in-memory deregistration.
+        self.wal.append(&WalRecord::DropIndex {
+            name: name.to_string(),
+        });
+        if let Err(e) = self.wal.commit_group() {
+            return Err(format!("wal failure committing DROP INDEX: {e:?}"));
+        }
+        self.indexes.remove(name);
         self.index_trees.remove(name);
         Ok(ExecResult::empty())
     }
@@ -361,13 +390,16 @@ impl<W: Write> Engine<W> {
 
         let logged = self
             .db
-            .commit::<()>(txn, |recs| {
+            .commit::<String>(txn, |recs| {
                 for r in recs {
                     self.wal.append(r);
                 }
-                self.wal.commit_group().map(|_| ()).map_err(|_| ())
+                self.wal
+                    .commit_group()
+                    .map(|_| ())
+                    .map_err(|e| format!("wal failure: {e:?}"))
             })
-            .map_err(|e| format!("wal failure: {e:?}"))?;
+            .map_err(|e| format!("wal failure: {e}"))?;
         logged.map_err(|c| format!("conflict on {:?}", c.key))?;
 
         Ok(ExecResult {
@@ -857,6 +889,190 @@ impl<W: Write> Engine<W> {
             rows: out_rows,
             rows_affected: 0,
         })
+    }
+}
+
+// == Durable database lifecycle (R2) =========================================
+
+/// WAL durability hook for file-backed databases: push committed groups
+/// across the OS durability boundary via `sync_data` (R2.3).
+fn sync_file(f: &mut std::fs::File) -> std::io::Result<()> {
+    f.sync_data()
+}
+
+impl Engine<std::fs::File> {
+    /// Create a fresh database at `path`: versioned metadata, canonical
+    /// directory layout, and an empty WAL. Fails if a database already
+    /// exists there (a pre-existing `db.meta` is authoritative).
+    pub fn create_db(path: impl AsRef<std::path::Path>) -> Result<Self, KError> {
+        let root = path.as_ref();
+        if crate::dbdir::meta_path(root).exists() {
+            return Err(KError::Other(format!(
+                "database already exists at {}",
+                root.display()
+            )));
+        }
+        crate::dbdir::create_layout(root)?;
+        crate::dbdir::write_meta(root)?;
+        let wal_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .append(true)
+            .open(crate::dbdir::wal_path(root))?;
+        Ok(Self {
+            db: MvccStore::new(),
+            wal: WalWriter::with_syncer(wal_file, sync_file),
+            tables: HashMap::new(),
+            next_row_id: HashMap::new(),
+            indexes: HashMap::new(),
+            index_trees: HashMap::new(),
+            columnar_dir: None,
+            delta_applier: None,
+            columnar_flush_threshold: 10_000,
+        })
+    }
+
+    /// Open a database at `path` and run startup recovery (R2.5):
+    ///
+    /// 1. validate `db.meta` versions,
+    /// 2. replay the WAL clean prefix,
+    /// 3. truncate a torn tail (crash during a commit group),
+    /// 4. apply the durable catalog (DDL records),
+    /// 5. redo committed transactions into the MVCC store,
+    /// 6. recompute row-id counters and rebuild secondary indexes,
+    /// 7. resume logging past the recovered prefix.
+    ///
+    /// Committed data is present after open; in-flight/aborted writes are
+    /// gone. Internal corruption (bad CRC, invalid frame lengths) fails
+    /// loudly rather than silently inventing state (R2.18).
+    pub fn open_db(path: impl AsRef<std::path::Path>) -> Result<Self, KError> {
+        let root = path.as_ref();
+        let _meta = crate::dbdir::read_meta(root)?;
+
+        let mut wal_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(crate::dbdir::wal_path(root))?;
+
+        let replay = qmind_kernel::WalReader::replay(&mut wal_file)?;
+        let recovered_count = replay.records.len();
+        if replay.torn_tail {
+            // Crash mid-commit-group: drop the partial frame, keep the prefix.
+            wal_file.set_len(replay.end_offset as u64)?;
+            wal_file.sync_data()?;
+        }
+
+        // ── Catalog: apply DDL records in log order (autocommit semantics). ──
+        let mut tables: HashMap<String, Vec<ColumnDef>> = HashMap::new();
+        let mut indexes: HashMap<String, IndexDef> = HashMap::new();
+        for (_, rec) in &replay.records {
+            match rec {
+                WalRecord::CreateTable { name, columns } => {
+                    tables.insert(name.clone(), catalog_to_column_def(columns));
+                }
+                WalRecord::CreateIndex {
+                    name,
+                    table,
+                    column,
+                } => {
+                    indexes.insert(
+                        name.clone(),
+                        IndexDef {
+                            name: name.clone(),
+                            table: table.clone(),
+                            column: column.clone(),
+                        },
+                    );
+                }
+                WalRecord::DropIndex { name } => {
+                    indexes.remove(name);
+                }
+                _ => {} // data records are handled by the kernel redo below
+            }
+        }
+
+        // ── Data: deterministic committed-state redo (R2.5/2.15). ──
+        let mut db = MvccStore::new();
+        db.redo_from_records(&replay.records);
+
+        // ── Row-id counters: max committed rid + 1 per table. ──
+        let snap = db.snapshot();
+        let mut next_row_id = HashMap::new();
+        for name in tables.keys() {
+            let prefix = format!("{name}\u{1}");
+            let mut max_rid: i64 = -1;
+            for (key, _) in db.scan_prefix(prefix.as_bytes(), &snap) {
+                let rest = &key[prefix.len()..];
+                if let Ok(rest) = std::str::from_utf8(rest) {
+                    if let Ok(rid) = rest.parse::<u64>() {
+                        max_rid = max_rid.max(rid as i64);
+                    }
+                }
+            }
+            next_row_id.insert(name.clone(), (max_rid + 1) as u64);
+        }
+
+        // ── Indexes (R2.10, option B): rebuild from committed rows. ──
+        let mut index_trees = HashMap::new();
+        for (idx_name, def) in &indexes {
+            let schema = tables
+                .get(&def.table)
+                .ok_or_else(|| KError::CatalogCorrupt {
+                    table: def.table.clone(),
+                    reason: format!("index `{idx_name}` references a missing table"),
+                })?;
+            let col_idx = col_pos(schema, &def.column).map_err(|e| KError::CatalogCorrupt {
+                table: def.table.clone(),
+                reason: format!("index `{idx_name}`: {e}"),
+            })?;
+            let mut tree = BTree::new();
+            let n = *next_row_id.get(&def.table).unwrap_or(&0);
+            for rid in 0..n {
+                if let Some(raw) = db.get_raw(&row_key(&def.table, rid), &snap) {
+                    if let Some(row) = decode_row(&raw, schema) {
+                        let v = &row[col_idx];
+                        if *v != SqlValue::Null {
+                            let key = index_key_encode(v).map_err(|e| KError::CatalogCorrupt {
+                                table: def.table.clone(),
+                                reason: e,
+                            })?;
+                            tree.insert(&key, rid);
+                        }
+                    }
+                }
+            }
+            index_trees.insert(idx_name.clone(), tree);
+        }
+
+        // ── Resume logging past the recovered prefix (already durable). ──
+        use std::io::Seek;
+        wal_file.seek(std::io::SeekFrom::Start(wal_file.metadata()?.len()))?;
+        let mut wal = WalWriter::with_syncer(wal_file, sync_file);
+        wal.resume(recovered_count as u64 + 1);
+
+        Ok(Self {
+            db,
+            wal,
+            tables,
+            next_row_id,
+            indexes,
+            index_trees,
+            columnar_dir: None,
+            delta_applier: None,
+            columnar_flush_threshold: 10_000,
+        })
+    }
+
+    /// Clean shutdown (R2.12): flush and sync any pending WAL group and
+    /// release the log file. Recovery never depends on this method being
+    /// called — `close` is a courtesy; crash safety comes from the log.
+    pub fn close(self) -> Result<(), KError> {
+        let Engine { wal, .. } = self;
+        let mut wal = wal;
+        wal.commit_group()?;
+        Ok(())
     }
 }
 
@@ -1431,6 +1647,34 @@ fn column_def_to_schema(table_name: &str, cols: &[ColumnDef]) -> TableSchema {
             })
             .collect(),
     }
+}
+
+/// Engine ColumnDefs → WAL CatalogColumn list (R2.4 durable catalog).
+fn column_def_to_catalog(cols: &[ColumnDef]) -> Vec<CatalogColumn> {
+    cols.iter()
+        .map(|c| CatalogColumn {
+            name: c.name.clone(),
+            kind: match c.ty {
+                ColumnType::Int => ColumnKind::Int,
+                ColumnType::Text => ColumnKind::Text,
+            },
+            nullable: c.nullable,
+        })
+        .collect()
+}
+
+/// WAL CatalogColumn list → engine ColumnDefs (recovery catalog apply).
+fn catalog_to_column_def(cols: &[CatalogColumn]) -> Vec<ColumnDef> {
+    cols.iter()
+        .map(|c| ColumnDef {
+            name: c.name.clone(),
+            ty: match c.kind {
+                ColumnKind::Int => ColumnType::Int,
+                ColumnKind::Text => ColumnType::Text,
+            },
+            nullable: c.nullable,
+        })
+        .collect()
 }
 
 /// Convert columnar ColValue back to engine SqlValue.

@@ -75,7 +75,7 @@ An embeddable relational database engine written in Rust, designed for hybrid tr
 | Write conflicts | First-committer-wins validation |
 | Locking | Strict 2PL — S/X locks, FIFO queues |
 | Deadlock | Wait-for graph + DFS cycle detection |
-| Recovery | ARIES: Analysis → Redo → Undo, WAL checkpoints |
+| Recovery | ARIES-style/logical WAL recovery (redo-only, record-level replay) — no physical checkpoints yet |
 
 ### Storage Engine
 
@@ -104,10 +104,12 @@ Pull-based streaming operators: `VecScan`, `Scan<Closure>`, `Filter`, `Project`,
 
 | Metric | Target | Status |
 |---|---|---|
-| Bulk insert | ≥ 500K rows/s | **2.49M rows/s** |
-| WAL write throughput | ≥ 1M rec/s | **6.1M rec/s** |
-| Page seal latency | < 1 μs | **123 ns** |
-| Recovery | zero committed-txn loss | Verified (50-txn kill-replay) |
+| Bulk insert | ≥ 500K rows/s | **Not re-measured in R2** |
+| WAL write throughput | ≥ 1M rec/s | **Not re-measured in R2** |
+| Page seal latency | < 1 μs | **Not re-measured in R2** |
+| Recovery | zero committed-txn loss | **R2 PASS** -- 7 subprocess crash-recovery tests; committed data survives `std::process::exit` kills; uncommitted data rolled back |
+
+> *Note: earlier R1 dev-build throughput numbers (2.49M rows/s, 6.1M rec/s, 123 ns) were not verified against the R2 codebase and are not claimed current. Only the recovery claim has R2 evidence.*
 
 ---
 
@@ -163,7 +165,7 @@ cd Quantsmind-Relational-DB
 cargo build --release
 
 # Run the server (Postgres wire protocol on port 5432)
-cargo run --release -p qmind-server -- 5432
+cargo run --release -p qmind-server -- ./qmind-data 5432
 
 # In another terminal — connect with the CLI
 cargo run --release -p qmind-cli -- 127.0.0.1:5432
@@ -220,7 +222,7 @@ winget install Rustlang.Rustup
 cargo build --release
 
 # Run server
-.\target\release\qmind-server.exe 5432
+.\target\release\qmind-server.exe .\qmind-data 5432
 
 # Run CLI
 .\target\release\qmind-cli.exe 127.0.0.1:5432
@@ -254,7 +256,7 @@ cd Quantsmind-Relational-DB
 cargo build --release
 
 # Run server
-./target/release/qmind-server 5432
+./target/release/qmind-server ./qmind-data 5432
 
 # Run CLI
 ./target/release/qmind-cli 127.0.0.1:5432
@@ -291,7 +293,7 @@ cd Quantsmind-Relational-DB
 cargo build --release
 
 # Run server
-./target/release/qmind-server 5432
+./target/release/qmind-server ./qmind-data 5432
 
 # Run CLI
 ./target/release/qmind-cli 127.0.0.1:5432
@@ -319,7 +321,7 @@ cd Quantsmind-Relational-DB
 cargo build --release
 
 # Run
-./target/release/qmind-server 5432
+./target/release/qmind-server ./qmind-data 5432
 ./target/release/qmind-cli 127.0.0.1:5432
 ```
 
@@ -333,7 +335,7 @@ The server speaks Postgres wire protocol v3, so any Postgres client works.
 
 ```bash
 # Start server
-cargo run --release -p qmind-server -- 5432
+cargo run --release -p qmind-server -- ./qmind-data 5432
 
 # Connect with psql (if available)
 psql -h 127.0.0.1 -p 5432 -U qmind
@@ -540,7 +542,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 | Suite | Count | Scope |
 |---|---|---|
-| Kernel unit | 62 | Pages, buffer pool, B+Tree, WAL, MVCC, locks, recovery, eviction, file store, columnar (M8) |
+| Kernel unit | 70 | Pages, buffer pool, B+Tree, WAL, MVCC, locks, recovery, eviction, file store, columnar (M8); DDL record roundtrip, syncer durability, resume LSN continuation, Display stability |
 | Kernel property/fuzz | 6 | Differential B+Tree, WAL truncation/corruption, MVCC serial history, crash→recovery zero-loss |
 | Kernel integration | 3 | Cross-store roundtrip |
 | Kernel read stress (P5) | 6 | Snapshot readers vs live writer: monotonicity, frozen snapshots, watermark advance |
@@ -549,9 +551,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 | SQL unit (parser/codec/executor) | 30 | Tokenizer, AST, case-insensitivity, strings, expression grammar, sort null-ordering, operators |
 | Parser fuzz | 4 | 8K random inputs, no panics |
 | Soak test | 1 | 10K row lifecycle across multiple tables |
+| SQL persistence (R2) | 12 | In-process create/insert/close/reopen, torn-tail truncation, corruption loud failure, format version gate |
+| SQL crash recovery (R2) | 7 | Real subprocess `std::process::exit` kills (R2.25 acceptance); uncommitted rollback; index rebuild; repeated restarts |
 | Wire protocol | 2 | TCP e2e (simple Query) + concurrent-reader no-torn-read (P5) |
 | Embedded API | 2 | JSON API contract |
-| **Total** | **143** | **All green, clippy clean** |
+| **Total** | **170** | **All green, clippy clean, fmt clean** |
 
 ---
 
