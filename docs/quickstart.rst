@@ -35,8 +35,10 @@ Engine + server
    # Build everything
    cargo build --release
 
-   # Run the server (Postgres wire protocol on port 5432)
-   cargo run --release -p qmind-server -- 5432
+   # Run the server (Postgres wire protocol on port 5432).
+   # First arg = data directory (created on first run, recovered on later
+   # runs), second arg = port.
+   cargo run --release -p qmind-server -- ./qmind-data 5432
 
    # In another terminal — connect with the CLI
    cargo run --release -p qmind-cli -- 127.0.0.1:5432

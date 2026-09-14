@@ -12,7 +12,7 @@
 //! wins), emits WAL records via the caller's sink BEFORE publishing, then
 //! appends versions to the chains.
 
-use crate::wal::{TxnId, WalRecord};
+use crate::wal::{Lsn, TxnId, WalRecord};
 use std::collections::{BTreeMap, HashMap};
 
 /// Immutable read horizon captured at transaction start.
@@ -153,6 +153,21 @@ impl MvccStore {
             .map(|v| v.value.clone())
     }
 
+    /// All keys under a byte prefix, each with its latest committed value.
+    /// Used at startup recovery to rebuild row-id counters and indexes from
+    /// the recovered committed state (R2.9/2.10). Keys sharing the prefix are
+    /// contiguous, so the scan stops at the first non-matching key.
+    pub fn scan_prefix(&self, prefix: &[u8], snap: &Snapshot) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.data
+            .range(prefix.to_vec()..)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .filter_map(|(k, chain)| {
+                let visible = chain.iter().rev().find(|v| v.commit_ts <= snap.read_ts)?;
+                Some((k.clone(), visible.value.clone()))
+            })
+            .collect()
+    }
+
     /// Buffer a write inside the transaction.
     pub fn set(&mut self, txn: TxnId, key: &[u8], value: Vec<u8>) {
         self.pending
@@ -229,6 +244,56 @@ impl MvccStore {
 
     pub fn commit_watermark(&self) -> u64 {
         self.mgr.commit_watermark()
+    }
+
+    /// Deterministic redo of a clean WAL prefix during startup recovery.
+    ///
+    /// Committed transactions are published in LSN order with ascending
+    /// commit timestamps; abort/in-flight state contributes nothing; DDL and
+    /// Checkpoint records carry no kernel state and are skipped. Afterwards
+    /// the manager resumes with `next_txn` past every replayed txn id so new
+    /// work never collides with recovered transactions. Repeated calls on the
+    /// same log produce identical state — recovery is a pure function of the
+    /// clean prefix (R2.5/2.15).
+    pub fn redo_from_records(&mut self, records: &[(Lsn, WalRecord)]) {
+        let mut active: HashMap<TxnId, Pending> = HashMap::new();
+        let mut max_txn: TxnId = 0;
+        for (_, rec) in records {
+            match rec {
+                WalRecord::Begin { txn } => {
+                    max_txn = max_txn.max(*txn);
+                    active.entry(*txn).or_insert_with(|| Pending {
+                        snap: Snapshot { read_ts: 0 },
+                        writes: BTreeMap::new(),
+                    });
+                }
+                WalRecord::Put { txn, key, value } => {
+                    max_txn = max_txn.max(*txn);
+                    if let Some(p) = active.get_mut(txn) {
+                        p.writes.insert(key.clone(), value.clone());
+                    }
+                }
+                WalRecord::Commit { txn } => {
+                    max_txn = max_txn.max(*txn);
+                    if let Some(pending) = active.remove(txn) {
+                        let commit_ts = self.mgr.commit_watermark + 1;
+                        for (key, value) in pending.writes {
+                            self.data
+                                .entry(key)
+                                .or_default()
+                                .push(Version { commit_ts, value });
+                        }
+                        self.mgr.commit_watermark += 1;
+                    }
+                }
+                WalRecord::Abort { txn } => {
+                    max_txn = max_txn.max(*txn);
+                    active.remove(txn);
+                }
+                _ => {}
+            }
+        }
+        self.mgr.next_txn = max_txn + 1;
     }
 }
 
@@ -327,6 +392,135 @@ mod tests {
         let (r, rs) = s.begin();
         assert_eq!(s.get(r, b"gone", &rs), None);
         assert!(s.data.is_empty());
+    }
+
+    #[test]
+    fn scan_prefix_yields_latest_committed_values_only() {
+        let mut s = MvccStore::new();
+        let (t, _) = s.begin();
+        s.set(t, b"t\x01a", vec![1]);
+        s.set(t, b"t\x01b", vec![2]);
+        s.set(t, b"u\x01a", vec![9]); // different table prefix `u`
+        s.commit::<()>(t, |_| Ok(())).unwrap().unwrap();
+
+        let snap = s.snapshot();
+        let rows = s.scan_prefix(b"t\x01", &snap);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(s.scan_prefix(b"t\x01x", &snap).len(), 0);
+
+        // Prefix must not be confused with a longer table name.
+        let (t2, _) = s.begin();
+        s.set(t2, b"ta\x01z", vec![3]);
+        s.commit::<()>(t2, |_| Ok(())).unwrap().unwrap();
+        let snap2 = s.snapshot();
+        assert_eq!(s.scan_prefix(b"t\x01", &snap2).len(), 2);
+        assert_eq!(s.scan_prefix(b"ta\x01", &snap2).len(), 1);
+    }
+
+    #[test]
+    fn redo_reproduces_committed_state_and_drops_inflight() {
+        // Build a log-equivalent record stream: one committed, one aborted,
+        // one left in-flight (no Commit record).
+        let records = vec![
+            (1, WalRecord::Begin { txn: 0 }),
+            (
+                2,
+                WalRecord::Put {
+                    txn: 0,
+                    key: b"a".to_vec(),
+                    value: vec![1],
+                },
+            ),
+            (3, WalRecord::Commit { txn: 0 }),
+            (4, WalRecord::Begin { txn: 1 }),
+            (
+                5,
+                WalRecord::Put {
+                    txn: 1,
+                    key: b"b".to_vec(),
+                    value: vec![2],
+                },
+            ),
+            (6, WalRecord::Abort { txn: 1 }),
+            (7, WalRecord::Begin { txn: 2 }),
+            (
+                8,
+                WalRecord::Put {
+                    txn: 2,
+                    key: b"c".to_vec(),
+                    value: vec![3],
+                },
+            ),
+        ];
+
+        let mut s = MvccStore::new();
+        s.redo_from_records(&records);
+
+        let (r, rs) = s.begin();
+        assert_eq!(r, 3, "replay resumes txn ids past the log");
+        assert_eq!(s.get(r, b"a", &rs), Some(vec![1]), "committed survives");
+        assert_eq!(s.get(r, b"b", &rs), None, "aborted leaves nothing");
+        assert_eq!(s.get(r, b"c", &rs), None, "in-flight leaves nothing");
+        assert_eq!(s.commit_watermark(), 1);
+
+        // New work must not collide with replayed transaction ids.
+        let (t3, s3) = s.begin();
+        assert_eq!(t3, 4);
+        s.set(t3, b"d", vec![4]);
+        s.commit::<()>(t3, |_| Ok(())).unwrap().unwrap();
+        assert_eq!(s.get(r, b"d", &s3), None, "replay assigns fresh watermark");
+        let (r2, s2) = s.begin();
+        assert_eq!(s.get(r2, b"d", &s2), Some(vec![4]));
+    }
+
+    #[test]
+    fn redo_is_deterministic_and_ignores_ddl_records() {
+        use crate::wal::{CatalogColumn, ColumnKind};
+        let with_ddl = vec![
+            (1, WalRecord::Begin { txn: 0 }),
+            (
+                2,
+                WalRecord::Put {
+                    txn: 0,
+                    key: b"k".to_vec(),
+                    value: vec![7],
+                },
+            ),
+            (
+                3,
+                WalRecord::CreateTable {
+                    name: "t".into(),
+                    columns: vec![CatalogColumn {
+                        name: "id".into(),
+                        kind: ColumnKind::Int,
+                        nullable: false,
+                    }],
+                },
+            ),
+            (4, WalRecord::Checkpoint { active: vec![] }),
+            (5, WalRecord::Commit { txn: 0 }),
+        ];
+
+        let mut a = MvccStore::new();
+        let mut b = MvccStore::new();
+        a.redo_from_records(&with_ddl);
+        b.redo_from_records(&with_ddl);
+
+        let (r, rs) = a.begin();
+        assert_eq!(a.get(r, b"k", &rs), Some(vec![7]));
+        assert_eq!(a.commit_watermark(), 1);
+
+        // Running recovery twice on a fresh instance yields identical state.
+        let mut c = MvccStore::new();
+        c.redo_from_records(&with_ddl);
+        let (r2, rs2) = b.begin();
+        let (r3, rs3) = c.begin();
+        assert_eq!(
+            a.get(r2, b"k", &rs2),
+            c.get(r3, b"k", &rs3),
+            "redo is a pure function of the log"
+        );
+        assert_eq!(b.commit_watermark(), c.commit_watermark());
     }
 
     #[test]

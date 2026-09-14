@@ -83,10 +83,13 @@ Feature surface (as of 0.1.0)
 * Storage: 8 KiB CRC32 pages, clock-sweep buffer pool, B+Tree, MVCC, versioned
   columnar replica (Raw/Dict/RLE), delta capture.
 * Runtime: zero runtime dependencies in the kernel; embeddable library.
+* Durability (R2): fsync-disciplined WAL with full-log replay, durable catalog,
+  index rebuild on open, torn-tail truncation, format versioning, subprocess
+  crash-recovery tests (170 tests, up from 143 at R1).
 
 Test suite
 ==========
 
-132 tests green across 5 crates (71 kernel + 58 SQL + 2 embed + 1 wire),
+170 tests green across 5 crates (85 kernel + 81 SQL + 2 embed + 2 wire),
 with ``cargo fmt --check`` and ``cargo clippy -D warnings`` enforced on CI
 (Ubuntu + Windows). See :ref:`testing` for the full breakdown.

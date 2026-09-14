@@ -53,7 +53,7 @@ Performance targets (contract)
      - **Not measured** — no TPC-H runner yet
    * - Recovery
      - zero committed-txn loss
-     - Validated by WAL replay / restart round-trip tests + P3 crash-injection harness (exhaustive byte-truncation, byte-flip corruption, 300-txn MVCC→WAL→recovery property test)
+     - WAL replay / restart round-trip tests + P3 crash-injection harness (exhaustive byte-truncation, byte-flip corruption, 300-txn MVCC→WAL→recovery property test) + R2 subprocess crash-recovery harness (`std::process::exit` kills, uncommitted rollback, index rebuild)
 
 Non-goals (v1)
 --------------
@@ -133,13 +133,21 @@ Row store & B+Tree (M1–M4)
   filter). Range lookups and NULL entries are not indexed. Writes serialize on
   a single engine writer; reads run concurrently over snapshots (§5).
 
-WAL & recovery (M1–M2)
-----------------------
+WAL & recovery (M1–M2, R2)
+--------------------------
 
 - CRC-checksummed WAL frames, **group commit** (one syscall per group),
   torn-tail-safe replay, committed-prefix crash semantics. **Implemented.**
-- Recovery: checkpoint + redo/undo replay from WAL; restart round-trip tests.
-  **Implemented.** *Full ``kill -9`` chaos harness: Planned.*
+- Discovery-R2 (R2): the WAL is now fsync-disciplined -- every committed
+  autocommit performs write -> flush -> ``f.sync_data()`` before returning.
+- Recovery (R2): startup ``open_db`` replays the full WAL, rebuilds the
+  catalog from DDL records, redos committed transactions, recomputes
+  ``next_row_id``, and rebuilds indexes from committed rows. Torn tails are
+  truncated; interior corruption fails the open loudly (``WalCorrupt``).
+- **Implemented.** Real subprocess ``kill``-style crash harness
+  (``crash_recovery.rs``: ``std::process::exit`` kills that bypass
+  destructors) proves committed data survives and uncommitted data rolls
+  back. Physical checkpoints and WAL rotation remain **Planned** (R3).
 
 Transactions / MVCC (M2)
 ------------------------
@@ -231,7 +239,7 @@ Testing strategy (Implemented today)
      - Method
      - Status
    * - Kernel units
-     - unit tests + CRC/format roundtrips (62 tests)
+     - unit tests + CRC/format roundtrips (70 tests)
      - Implemented
    * - Property/fuzz
      - deterministic differential harness: B+Tree vs oracle (4K ops), WAL every-byte truncation + 400 byte-flip corruptions, MVCC serial-history (1200 steps), 300-txn crash→recovery zero-loss (6 tests)

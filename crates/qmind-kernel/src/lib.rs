@@ -28,4 +28,4 @@ pub use buffer::{BufferPool, PageStore, RamPageStore};
 pub use error::{Error, Result};
 pub use mvcc::{Conflict, IsolationLevel, MvccStore, Snapshot};
 pub use page::{Page, PageHeader, PageId, PAGE_SIZE};
-pub use wal::{Lsn, WalReader, WalRecord, WalWriter};
+pub use wal::{CatalogColumn, ColumnKind, Lsn, WalReader, WalRecord, WalWriter};

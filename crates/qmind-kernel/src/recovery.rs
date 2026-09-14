@@ -60,7 +60,10 @@ pub fn recover(log: &[u8]) -> Result<RecoveredState, crate::Error> {
                     status.entry(*t).or_insert(TxnStatus::InFlight);
                 }
             }
-            WalRecord::Put { .. } => {}
+            WalRecord::Put { .. }
+            | WalRecord::CreateTable { .. }
+            | WalRecord::CreateIndex { .. }
+            | WalRecord::DropIndex { .. } => {}
         }
     }
     // torn tail: trailing InFlight txns were in-flight at crash
@@ -117,6 +120,7 @@ mod tests {
         let mut w = WalWriter::new(&mut log);
         f(&mut w);
         w.commit_group().unwrap();
+        drop(w); // release the borrow before returning `log`
         log
     }
 

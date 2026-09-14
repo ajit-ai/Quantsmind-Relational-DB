@@ -118,6 +118,21 @@ fn frame_len(rec: &WalRecord) -> usize {
         WalRecord::Begin { .. } | WalRecord::Commit { .. } | WalRecord::Abort { .. } => 1 + 8,
         WalRecord::Checkpoint { active } => 1 + 4 + 8 * active.len(),
         WalRecord::Put { key, value, .. } => 1 + 8 + 4 + key.len() + 4 + value.len(),
+        WalRecord::CreateTable { name, columns } => {
+            1 + 4
+                + name.len()
+                + 4
+                + columns
+                    .iter()
+                    .map(|c| 4 + c.name.len() + 1 + 1)
+                    .sum::<usize>()
+        }
+        WalRecord::CreateIndex {
+            name,
+            table,
+            column,
+        } => 1 + 4 + name.len() + 4 + table.len() + 4 + column.len(),
+        WalRecord::DropIndex { name } => 1 + 4 + name.len(),
     };
     8 + payload
 }

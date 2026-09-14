@@ -6,6 +6,7 @@
 //! - M4: joins, aggregates, secondary indexes, OLTP/OLAP plan routing (D-001)
 
 pub mod codec;
+pub mod dbdir;
 pub mod engine;
 pub mod executor;
 pub mod parser;

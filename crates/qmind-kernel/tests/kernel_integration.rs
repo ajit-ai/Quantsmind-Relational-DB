@@ -82,7 +82,10 @@ fn replay_recovers_exactly_the_committed_row_set() {
             WalRecord::Abort { txn } => {
                 open.remove(txn); // writes discarded
             }
-            WalRecord::Checkpoint { .. } => {}
+            WalRecord::Checkpoint { .. }
+            | WalRecord::CreateTable { .. }
+            | WalRecord::CreateIndex { .. }
+            | WalRecord::DropIndex { .. } => {}
         }
     }
 
@@ -155,7 +158,10 @@ fn mvcc_commit_rides_wal_and_recovery_rebuilds_state() {
             WalRecord::Abort { txn } => {
                 open.remove(txn);
             }
-            WalRecord::Checkpoint { .. } => {}
+            WalRecord::Checkpoint { .. }
+            | WalRecord::CreateTable { .. }
+            | WalRecord::CreateIndex { .. }
+            | WalRecord::DropIndex { .. } => {}
         }
     }
 
