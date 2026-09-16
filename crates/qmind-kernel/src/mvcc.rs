@@ -153,6 +153,19 @@ impl MvccStore {
             .map(|v| v.value.clone())
     }
 
+    /// Txn-aware read: sees the caller's own buffered writes first
+    /// (read-your-own-writes), then falls through to the committed chain under
+    /// the snapshot. `None` carries no transaction context and behaves exactly
+    /// like [`MvccStore::get_raw`] — this is the single read entry point the
+    /// SQL engine uses so explicit transactions observe their own uncommitted
+    /// state while foreign uncommitted writes stay invisible.
+    pub fn read(&self, txn: Option<TxnId>, key: &[u8], snap: &Snapshot) -> Option<Vec<u8>> {
+        match txn {
+            Some(t) => self.get(t, key, snap),
+            None => self.get_raw(key, snap),
+        }
+    }
+
     /// All keys under a byte prefix, each with its latest committed value.
     /// Used at startup recovery to rebuild row-id counters and indexes from
     /// the recovered committed state (R2.9/2.10). Keys sharing the prefix are

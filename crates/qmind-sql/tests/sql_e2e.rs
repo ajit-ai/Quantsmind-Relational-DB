@@ -735,3 +735,301 @@ fn create_index_errors_and_drop_index() {
     assert!(eng.execute("CREATE INDEX j ON a (x)").is_ok());
     eng.execute("DROP INDEX j").unwrap();
 }
+
+// ── R3 storage-backed streaming queries ─────────────────────────────────────
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn r3_dir(tag: &str) -> std::path::PathBuf {
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("qmind-r3-{tag}-pid{}-{n}", std::process::id()))
+}
+
+#[test]
+fn stream_query_pulls_from_persistent_storage() {
+    let dir = r3_dir("stream");
+    {
+        let mut eng = Engine::<std::fs::File>::create_db(&dir).unwrap();
+        eng.execute("CREATE TABLE users (id INTEGER NOT NULL, name TEXT, city TEXT)")
+            .unwrap();
+        eng.execute("INSERT INTO users VALUES (1, 'Ada', 'London'), (2, 'Grace', 'New York'), (3, 'Edsger', 'Austin')")
+            .unwrap();
+
+        // Streaming path: WHERE + projection + ORDER BY (materialized fallback).
+        let mut batches: Vec<Vec<SqlValue>> = Vec::new();
+        let res = eng
+            .stream_query(
+                "SELECT id, name FROM users WHERE id >= 2 ORDER BY id",
+                |b| {
+                    for i in 0..b.num_rows() {
+                        batches.push(b.row(i));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(res.columns, vec!["id", "name"]);
+        assert_eq!(
+            batches,
+            vec![
+                vec![SqlValue::Int(2), SqlValue::Text("Grace".into())],
+                vec![SqlValue::Int(3), SqlValue::Text("Edsger".into())],
+            ]
+        );
+
+        // COUNT(*) is an aggregate: routed through the batch aggregate path
+        // (R3-EXEC-1) and streamed to the sink as a single output row.
+        let mut agg_rows: Vec<Vec<SqlValue>> = Vec::new();
+        let res = eng
+            .stream_query("SELECT COUNT(*) FROM users", |b| {
+                for i in 0..b.num_rows() {
+                    agg_rows.push(b.row(i));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(res.columns, vec!["COUNT(*)"]);
+        assert_eq!(agg_rows, vec![vec![SqlValue::Int(3)]]);
+        eng.close().unwrap();
+    }
+
+    // Stream bounds are independent from the WAL snapshot: page storage is
+    // rebuilt from committed rows on reopen, so streaming still works.
+    let mut eng = Engine::<std::fs::File>::open_db(&dir).unwrap();
+    let mut seen: u64 = 0;
+    eng.stream_query("SELECT id FROM users", |b| {
+        seen += b.num_rows() as u64;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen, 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn stream_rows(eng: &mut Engine<std::fs::File>, sql: &str) -> (Vec<String>, Vec<Vec<SqlValue>>) {
+    let mut out: Vec<Vec<SqlValue>> = Vec::new();
+    let r = eng
+        .stream_query(sql, |b| {
+            for i in 0..b.num_rows() {
+                out.push(b.row(i));
+            }
+            Ok(())
+        })
+        .unwrap();
+    (r.columns, out)
+}
+
+#[test]
+fn stream_aggregates_parity_with_volcano() {
+    let dir = r3_dir("agg-stream");
+    let mut eng = Engine::<std::fs::File>::create_db(&dir).unwrap();
+    eng.execute("CREATE TABLE s (id INTEGER NOT NULL, v INTEGER)")
+        .unwrap();
+    // Every 7th value is NULL; mix of negative and positive magnitudes.
+    for i in 0..50i64 {
+        let v = if i % 7 == 0 {
+            "NULL".to_string()
+        } else {
+            (i * 3 - 100).to_string()
+        };
+        eng.execute(&format!("INSERT INTO s VALUES ({i}, {v})"))
+            .unwrap();
+    }
+    for sql in [
+        "SELECT COUNT(*) FROM s",
+        "SELECT COUNT(v) FROM s",
+        "SELECT SUM(v) FROM s",
+        "SELECT AVG(v) FROM s",
+        "SELECT MIN(v) FROM s",
+        "SELECT MAX(v) FROM s",
+        "SELECT COUNT(*), SUM(v), MIN(v), MAX(v) FROM s WHERE v > 0",
+        // NULL-only aggregate input: both executors return a single empty row
+        // for the value aggregates and 0 for COUNT(v) / COUNT(*).
+        "SELECT COUNT(v), COUNT(*) FROM s WHERE v > 1000000",
+    ] {
+        let expected = eng.execute(sql).unwrap();
+        let (cols, got) = stream_rows(&mut eng, sql);
+        assert_eq!(cols, expected.columns, "columns for {sql}");
+        assert_eq!(got, expected.rows, "rows for {sql}");
+    }
+    eng.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stream_group_by_parity_and_persistent_reopen() {
+    let dir = r3_dir("grp-stream");
+    {
+        let mut eng = Engine::<std::fs::File>::create_db(&dir).unwrap();
+        eng.execute(
+            "CREATE TABLE t (id INTEGER NOT NULL, grp INTEGER NOT NULL, amt INTEGER NOT NULL)",
+        )
+        .unwrap();
+        for i in 0..200i64 {
+            eng.execute(&format!(
+                "INSERT INTO t VALUES ({i}, {}, {})",
+                i % 4,
+                (i * 7) % 100
+            ))
+            .unwrap();
+        }
+        for sql in [
+            "SELECT grp, COUNT(*) FROM t GROUP BY grp",
+            "SELECT grp, SUM(amt), AVG(amt), MIN(amt), MAX(amt) FROM t GROUP BY grp",
+            "SELECT grp, COUNT(*) FROM t WHERE grp >= 2 GROUP BY grp",
+            "SELECT grp, COUNT(*) FROM t GROUP BY grp ORDER BY COUNT(*) DESC",
+            "SELECT grp, SUM(amt) FROM t GROUP BY grp ORDER BY grp DESC",
+        ] {
+            let expected = eng.execute(sql).unwrap();
+            let (cols, got) = stream_rows(&mut eng, sql);
+            assert_eq!(cols, expected.columns, "columns for {sql}");
+            assert_eq!(got, expected.rows, "rows for {sql}");
+        }
+        eng.close().unwrap();
+    }
+
+    // After reopen the batch aggregate path runs over rebuilt page storage.
+    let mut eng = Engine::<std::fs::File>::open_db(&dir).unwrap();
+    let mut sum_of_sums: i64 = 0;
+    eng.stream_query("SELECT grp, SUM(amt) FROM t GROUP BY grp", |b| {
+        for i in 0..b.num_rows() {
+            if let SqlValue::Int(v) = b.row(i)[1] {
+                sum_of_sums += v;
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    let expected: i64 = (0..200i64).map(|i| (i * 7) % 100).sum();
+    assert_eq!(sum_of_sums, expected);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stream_join_parity_and_persistent_reopen() {
+    let dir = r3_dir("join-stream");
+    {
+        let mut eng = Engine::<std::fs::File>::create_db(&dir).unwrap();
+        eng.execute("CREATE TABLE customers (id INTEGER NOT NULL, name TEXT NOT NULL)")
+            .unwrap();
+        eng.execute(
+            "CREATE TABLE orders (oid INTEGER NOT NULL, cid INTEGER NOT NULL, amount INTEGER NOT NULL)",
+        )
+        .unwrap();
+        for i in 0..40i64 {
+            eng.execute(&format!("INSERT INTO customers VALUES ({i}, 'cust_{i}')"))
+                .unwrap();
+        }
+        // orders reference customers cid = id % 20, so every customer in
+        // [0,20) has 3 orders and [20,40) has none.
+        for i in 0..60i64 {
+            eng.execute(&format!(
+                "INSERT INTO orders VALUES ({i}, {}, {})",
+                i % 20,
+                i * 3
+            ))
+            .unwrap();
+        }
+        for sql in [
+            "SELECT id, amount FROM customers INNER JOIN orders ON id = cid",
+            "SELECT id, oid, amount FROM customers INNER JOIN orders ON id = cid WHERE amount > 90",
+            "SELECT * FROM customers INNER JOIN orders ON id = cid",
+            "SELECT name, amount FROM customers INNER JOIN orders ON id = cid ORDER BY amount LIMIT 8",
+        ] {
+            let expected = eng.execute(sql).unwrap();
+            let (cols, mut got) = stream_rows(&mut eng, sql);
+            assert_eq!(cols, expected.columns, "columns for {sql}");
+            if sql.contains("ORDER BY") {
+                assert_eq!(got, expected.rows, "rows (ordered) for {sql}");
+            } else {
+                got.sort();
+                let mut exp = expected.rows;
+                exp.sort();
+                assert_eq!(got, exp, "rows (unordered) for {sql}");
+            }
+        }
+        eng.close().unwrap();
+    }
+
+    // After reopen the batch join reads the rebuilt page storage.
+    let mut eng = Engine::<std::fs::File>::open_db(&dir).unwrap();
+    let (_, got) = stream_rows(
+        &mut eng,
+        "SELECT id FROM customers INNER JOIN orders ON id = cid",
+    );
+    assert_eq!(got.len(), 60);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn open_wipes_stale_page_files_and_rebuilds_from_wal() {
+    // R3-STORAGE regression: on open the existing `tables/` directory is
+    // wiped and rebuilt from the WAL (transitional authority). Even if a
+    // previous session left a corrupt segment or foreign file behind, open
+    // must succeed and the rebuilt page store must match the committed rows.
+    let dir = r3_dir("stale-pages");
+    {
+        let mut eng = Engine::<std::fs::File>::create_db(&dir).unwrap();
+        eng.execute("CREATE TABLE t (id INTEGER NOT NULL, v TEXT)")
+            .unwrap();
+        for i in 0..50u64 {
+            eng.execute(&format!("INSERT INTO t VALUES ({i}, 'p0_{i}')"))
+                .unwrap();
+        }
+        eng.close().unwrap();
+    }
+    // Corrupt/junk the page store for two consecutive opens: a stale segment
+    // with bad magic and a foreign file that FilePageStore::open would reject
+    // if it kept them.
+    for _ in 0..2u64 {
+        let tables_dir = dir.join(qmind_sql::dbdir::TABLES_DIR);
+        std::fs::create_dir_all(&tables_dir).unwrap();
+        std::fs::write(tables_dir.join("seg_000000.bin"), b"GARBAGEGARBAGE").unwrap();
+        std::fs::write(tables_dir.join("seg_000000_old.bin"), b"leftover").unwrap();
+
+        let mut eng = Engine::<std::fs::File>::open_db(&dir).unwrap();
+        // Both read paths must agree on the WAL-recovered rows after the wipe.
+        let (_, cnt) = stream_rows(&mut eng, "SELECT COUNT(*) FROM t");
+        assert_eq!(cnt, vec![vec![SqlValue::Int(50)]]);
+        let (_, got) = stream_rows(&mut eng, "SELECT id, v FROM t ORDER BY id");
+        assert_eq!(got.len(), 50);
+        assert_eq!(
+            got[0],
+            vec![SqlValue::Int(0), SqlValue::Text("p0_0".into())]
+        );
+        assert_eq!(
+            got[49],
+            vec![SqlValue::Int(49), SqlValue::Text("p0_49".into())]
+        );
+        assert_eq!(eng.execute("SELECT COUNT(*) FROM t").unwrap().rows, cnt);
+        eng.close().unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn empty_table_created_then_reopened_streams_zero_rows() {
+    // R3-STORAGE regression: a table that was created but never inserted into
+    // survives close/reopen with no pages; streaming aggregation over it must
+    // still produce a single COUNT(*)=0 row (same as the volcano path).
+    let dir = r3_dir("empty-table");
+    {
+        let mut eng = Engine::<std::fs::File>::create_db(&dir).unwrap();
+        eng.execute("CREATE TABLE empty_t (id INTEGER NOT NULL, v INTEGER)")
+            .unwrap();
+        eng.close().unwrap();
+    }
+    let mut eng = Engine::<std::fs::File>::open_db(&dir).unwrap();
+    let via_exec = eng.execute("SELECT COUNT(*) FROM empty_t").unwrap();
+    let (_, got) = stream_rows(&mut eng, "SELECT COUNT(*) FROM empty_t");
+    assert_eq!(got, via_exec.rows);
+    assert_eq!(got, vec![vec![SqlValue::Int(0)]]);
+    let (_, scan) = stream_rows(&mut eng, "SELECT * FROM empty_t");
+    assert!(scan.is_empty());
+    eng.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

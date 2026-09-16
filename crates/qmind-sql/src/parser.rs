@@ -57,6 +57,9 @@ pub enum Statement {
     },
     Select(Select),
     ShowTables,
+    Begin,
+    Commit,
+    Rollback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,6 +205,11 @@ const KEYWORDS: &[(&str, &str)] = &[
     ("AVG", "AVG"),
     ("MIN", "MIN"),
     ("MAX", "MAX"),
+    ("BEGIN", "BEGIN"),
+    ("COMMIT", "COMMIT"),
+    ("ROLLBACK", "ROLLBACK"),
+    ("TRANSACTION", "TRANSACTION"),
+    ("WORK", "WORK"),
 ];
 
 pub fn tokenize(sql: &str) -> Result<Vec<Token>, String> {
@@ -397,8 +405,47 @@ impl Parser {
             Token::Keyword("INSERT") => self.parse_insert(),
             Token::Keyword("SELECT") => self.parse_select().map(Statement::Select),
             Token::Keyword("SHOW") => self.parse_show_tables(),
+            Token::Keyword("BEGIN") => self.parse_begin(),
+            Token::Keyword("COMMIT") => self.parse_commit(),
+            Token::Keyword("ROLLBACK") => self.parse_rollback(),
             t => Err(format!("unsupported statement, got {t:?}")),
         }
+    }
+
+    fn parse_begin(&mut self) -> Result<Statement, String> {
+        self.expect_keyword("BEGIN")?;
+        // Optional: BEGIN [TRANSACTION | WORK]
+        if matches!(
+            self.peek(),
+            Token::Keyword("TRANSACTION") | Token::Keyword("WORK")
+        ) {
+            self.advance();
+        }
+        Ok(Statement::Begin)
+    }
+
+    fn parse_commit(&mut self) -> Result<Statement, String> {
+        self.expect_keyword("COMMIT")?;
+        // Optional: COMMIT [TRANSACTION | WORK]
+        if matches!(
+            self.peek(),
+            Token::Keyword("TRANSACTION") | Token::Keyword("WORK")
+        ) {
+            self.advance();
+        }
+        Ok(Statement::Commit)
+    }
+
+    fn parse_rollback(&mut self) -> Result<Statement, String> {
+        self.expect_keyword("ROLLBACK")?;
+        // Optional: ROLLBACK [TRANSACTION | WORK]
+        if matches!(
+            self.peek(),
+            Token::Keyword("TRANSACTION") | Token::Keyword("WORK")
+        ) {
+            self.advance();
+        }
+        Ok(Statement::Rollback)
     }
 
     fn parse_create(&mut self) -> Result<Statement, String> {

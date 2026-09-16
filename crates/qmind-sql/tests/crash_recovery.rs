@@ -185,3 +185,44 @@ fn r2_25_acceptance_crash_recovery_scenario() {
     assert_eq!(verify_lookup(&dir, "customers", "name", "user_1"), 1);
     assert_eq!(verify_lookup(&dir, "customers", "name", "user_0"), 4);
 }
+
+#[test]
+fn page_store_rebuilt_matches_wal_state_after_crash() {
+    // R3-STORAGE regression: the persistent page store is rebuilt from the
+    // WAL on open, but `verify-count`/`verify-lookup` only read the MVCC side.
+    // This test drives post-crash reads through `stream_query` (the page
+    // store) and cross-checks them against the WAL-recovered MVCC rows, so a
+    // divergence in the reconstructed page storage fails loudly.
+    let dir = fresh_dir("pages");
+    init(&dir);
+    // Both tables committed, each process crashes hard mid-write.
+    commit_rows(&dir, "customers", 40);
+    commit_rows(&dir, "orders", 25);
+    // Recovery rebuilds BOTH tables' page storage from the WAL; verify-stream
+    // compares stream_query vs execute row-for-row inside a fresh process.
+    run(&["verify-stream", dir.to_str().unwrap()], 0);
+    assert_eq!(verify_count(&dir, "customers"), 40);
+    assert_eq!(verify_count(&dir, "orders"), 25);
+
+    // Further crash/restart cycles keep page storage in lockstep with the log.
+    commit_rows(&dir, "customers", 7);
+    run(&["verify-stream", dir.to_str().unwrap()], 0);
+    commit_rows(&dir, "orders", 3);
+    run(&["verify-stream", dir.to_str().unwrap()], 0);
+    assert_eq!(verify_count(&dir, "customers"), 47);
+    assert_eq!(verify_count(&dir, "orders"), 28);
+}
+
+#[test]
+fn uncommitted_rows_never_leak_into_rebuilt_pages() {
+    // The WAL drops in-flight transactions on recovery; the rebuilt page
+    // store must not contain those ghost rows either (both read paths agree).
+    let dir = fresh_dir("ghost-pages");
+    init(&dir);
+    commit_rows(&dir, "customers", 2);
+    insert_uncommitted(&dir, "orders", 5);
+    // Orders table: 0 committed rows in both MVCC and page storage.
+    run(&["verify-stream", dir.to_str().unwrap()], 0);
+    assert_eq!(verify_count(&dir, "customers"), 2);
+    assert_eq!(verify_count(&dir, "orders"), 0);
+}

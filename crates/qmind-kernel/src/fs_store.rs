@@ -7,7 +7,7 @@
 
 use crate::buffer::PageStore;
 use crate::error::{Error, Result};
-use crate::page::{PageId, PAGE_SIZE, FORMAT_VERSION};
+use crate::page::{PageId, FORMAT_VERSION, PAGE_SIZE};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -17,6 +17,7 @@ pub const SEGMENT_MAGIC: &[u8; 8] = b"QMINDSEG";
 pub const PAGES_PER_SEGMENT: u64 = 256;
 const HEADER_SIZE: u64 = 16;
 
+#[derive(Debug)]
 pub struct FilePageStore {
     dir: PathBuf,
     segments: std::collections::HashMap<u64, File>,
@@ -37,9 +38,9 @@ impl FilePageStore {
                 .strip_prefix("seg_")
                 .and_then(|s| s.strip_suffix(".bin"))
             {
-                let n: u64 = seg.parse().map_err(|_| {
-                    Error::Other(format!("unexpected file in data dir: {name}"))
-                })?;
+                let n: u64 = seg
+                    .parse()
+                    .map_err(|_| Error::Other(format!("unexpected file in data dir: {name}")))?;
                 validate_segment(&entry.path())?;
                 segments.insert(n, open_rw(&entry.path())?);
             }
@@ -108,7 +109,7 @@ impl PageStore for FilePageStore {
     }
 
     fn sync(&mut self) -> Result<()> {
-        for (_, f) in self.segments.iter_mut() {
+        for f in self.segments.values_mut() {
             f.sync_all()?;
         }
         Ok(())
@@ -264,7 +265,7 @@ mod tests {
     fn reserved_page_zero_is_rejected() {
         let dir = temp_dir("zeropage");
         let mut store = FilePageStore::open(&dir).unwrap();
-        let mut buf = vec![0u8; PAGE_SIZE];
+        let buf = vec![0u8; PAGE_SIZE];
         assert!(store.write_page(0, &buf).is_err());
         let _ = fs::remove_dir_all(dir);
     }

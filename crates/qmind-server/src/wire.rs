@@ -65,6 +65,7 @@ fn handle_conn<W: Write>(mut s: TcpStream, eng: Arc<RwLock<Engine<W>>>) -> std::
     param(&mut s, "client_encoding", "UTF8")?;
     ready(&mut s)?;
 
+    let mut session_txn = false;
     loop {
         let Some((tag, payload)) = read_packet(&mut s)? else {
             return Ok(());
@@ -74,7 +75,9 @@ fn handle_conn<W: Write>(mut s: TcpStream, eng: Arc<RwLock<Engine<W>>>) -> std::
                 let sql = String::from_utf8_lossy(&payload)
                     .trim_end_matches('\0')
                     .to_string();
-                run_query(&mut s, &eng, &sql)?;
+                // R4: each connection is a session that may own the engine's
+                // single explicit transaction across packets.
+                run_query(&mut s, &eng, &sql, &mut session_txn)?;
             }
             b'X' => return Ok(()),
             _ => {
@@ -89,6 +92,7 @@ fn run_query<W: Write>(
     s: &mut TcpStream,
     eng: &Arc<RwLock<Engine<W>>>,
     sql: &str,
+    session_txn: &mut bool,
 ) -> std::io::Result<()> {
     // Multiple statements separated by ';' execute sequentially.
     let stmts: Vec<&str> = sql
@@ -101,10 +105,13 @@ fn run_query<W: Write>(
         return ready(s);
     }
     for st in stmts {
-        // P5: route by leading keyword — reads run on a shared guard via
-        // `execute_read` (snapshot), writes take the exclusive guard.
         let kw = st.split_whitespace().next().map(|w| w.to_ascii_uppercase());
-        let res = if matches!(kw.as_deref(), Some("SELECT") | Some("SHOW")) {
+        // R4 transaction routing: while this session owns the engine's single
+        // explicit transaction, every statement (including SELECT) runs on the
+        // write path so the transaction's own uncommitted writes stay visible.
+        // When a *foreign* session owns it, reads still run on a committed-only
+        // snapshot and writes are rejected (single-writer constraint).
+        let foreign_txn = {
             let guard = match eng.read() {
                 Ok(g) => g,
                 Err(_) => {
@@ -112,8 +119,23 @@ fn run_query<W: Write>(
                     return ready(s);
                 }
             };
-            guard.execute_read(st)
-        } else {
+            guard.in_transaction() && !*session_txn
+        };
+        let res = if *session_txn || foreign_txn {
+            if foreign_txn
+                && !matches!(kw.as_deref(), Some("SELECT") | Some("SHOW"))
+                && !matches!(
+                    kw.as_deref(),
+                    Some("BEGIN") | Some("COMMIT") | Some("ROLLBACK")
+                )
+            {
+                error(
+                    s,
+                    "another explicit transaction is in progress on this database \
+                     (single-writer constraint); commit or roll it back first",
+                )?;
+                break;
+            }
             let mut guard = match eng.write() {
                 Ok(g) => g,
                 Err(_) => {
@@ -121,10 +143,44 @@ fn run_query<W: Write>(
                     return ready(s);
                 }
             };
-            guard.execute(st)
+            if foreign_txn {
+                // SELECT/SHOW on concurrent sessions must not be polluted by the
+                // owner's uncommitted writes, so use a committed snapshot only.
+                guard.execute_read(st)
+            } else {
+                guard.execute(st)
+            }
+        } else {
+            // No transaction anywhere: P5 keyword routing — reads on the shared
+            // guard, writes on the exclusive guard.
+            let res = if matches!(kw.as_deref(), Some("SELECT") | Some("SHOW")) {
+                let guard = match eng.read() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        error(s, "engine poisoned")?;
+                        return ready(s);
+                    }
+                };
+                guard.execute_read(st)
+            } else {
+                let mut guard = match eng.write() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        error(s, "engine poisoned")?;
+                        return ready(s);
+                    }
+                };
+                guard.execute(st)
+            };
+            res
         };
         match res {
             Ok(res) => {
+                match kw.as_deref() {
+                    Some("BEGIN") => *session_txn = true,
+                    Some("COMMIT") | Some("ROLLBACK") => *session_txn = false,
+                    _ => {}
+                }
                 if !res.columns.is_empty() {
                     row_description(s, &res.columns)?;
                     for row in &res.rows {
