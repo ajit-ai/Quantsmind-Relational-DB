@@ -5,6 +5,7 @@
 use qmind_sql::{Engine, SqlValue};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 const PROTOCOL_V3: i32 = 196608;
@@ -14,11 +15,17 @@ pub fn serve<W: Write + Send + Sync + 'static>(
     listener: TcpListener,
     engine: Arc<RwLock<Engine<W>>>,
 ) {
+    let next_session = Arc::new(AtomicU64::new(1));
     for stream in listener.incoming() {
         let Ok(s) = stream else { continue };
         let e = Arc::clone(&engine);
+        let ns = Arc::clone(&next_session);
         std::thread::spawn(move || {
-            let _ = handle_conn(s, e);
+            // R4-MULTIWRITER: every connection is a distinct session that may
+            // own its own explicit transaction across packets, concurrently
+            // with every other connection.
+            let sid = ns.fetch_add(1, Ordering::SeqCst);
+            let _ = handle_conn(s, e, sid);
         });
     }
 }
@@ -39,7 +46,11 @@ fn read_packet(stream: &mut TcpStream) -> std::io::Result<Option<(u8, Vec<u8>)>>
     Ok(Some((t[0], p)))
 }
 
-fn handle_conn<W: Write>(mut s: TcpStream, eng: Arc<RwLock<Engine<W>>>) -> std::io::Result<()> {
+fn handle_conn<W: Write>(
+    mut s: TcpStream,
+    eng: Arc<RwLock<Engine<W>>>,
+    session: u64,
+) -> std::io::Result<()> {
     let mut lb = [0u8; 4];
     if s.read_exact(&mut lb).is_err() {
         return Ok(());
@@ -55,7 +66,7 @@ fn handle_conn<W: Write>(mut s: TcpStream, eng: Arc<RwLock<Engine<W>>>) -> std::
         // SSLRequest
         s.write_all(b"N")?;
         s.flush()?;
-        return handle_conn(s, eng);
+        return handle_conn(s, eng, session);
     }
     if proto != PROTOCOL_V3 {
         return Ok(());
@@ -65,16 +76,14 @@ fn handle_conn<W: Write>(mut s: TcpStream, eng: Arc<RwLock<Engine<W>>>) -> std::
     param(&mut s, "client_encoding", "UTF8")?;
     ready(&mut s)?;
 
-    let mut session_txn = false;
+    let mut session_has_txn = false;
     while let Some((tag, payload)) = read_packet(&mut s)? {
         match tag {
             b'Q' => {
                 let sql = String::from_utf8_lossy(&payload)
                     .trim_end_matches('\0')
                     .to_string();
-                // R4: each connection is a session that may own the engine's
-                // single explicit transaction across packets.
-                run_query(&mut s, &eng, &sql, &mut session_txn)?;
+                run_query(&mut s, &eng, session, &sql, &mut session_has_txn)?;
             }
             b'X' => break,
             _ => {
@@ -83,35 +92,38 @@ fn handle_conn<W: Write>(mut s: TcpStream, eng: Arc<RwLock<Engine<W>>>) -> std::
             }
         }
     }
-    // R4-CONCURRENCY: a session that owns the engine's single explicit
-    // transaction and then disconnects (Terminate packet or TCP close) must
-    // release its writer ownership. Without this the engine's transaction slot
-    // stays permanently active and every later writer would be rejected under
-    // the single-writer constraint. ROLLBACK is a pure in-memory discard here:
-    // nothing was materialized mid-transaction.
-    release_session_txn(&eng, session_txn);
+    // R4-MULTIWRITER: a session that owns an explicit transaction and then
+    // disconnects (Terminate packet or TCP close) must have that transaction
+    // rolled back so its row locks are released and other sessions are never
+    // blocked. The rollback is per session; every other session's transaction
+    // is unaffected. ROLLBACK is a pure in-memory discard here: nothing was
+    // materialized mid-transaction.
+    release_session_txn(&eng, session);
     Ok(())
 }
 
-/// R4-CONCURRENCY: if `session_txn` owns the engine's single explicit
-/// transaction, abort it so writer ownership is released when the connection
+/// R4-MULTIWRITER: if `session` holds an explicit transaction, abort it so the
+/// transaction's locks and pending writes are released when the connection
 /// ends without an explicit COMMIT or ROLLBACK. Safe to call at most once per
-/// connection; the engine may already have reaped the transaction (a failed
-/// COMMIT), in which case this is a no-op.
-fn release_session_txn<W: Write>(eng: &Arc<RwLock<Engine<W>>>, session_txn: bool) {
-    if !session_txn {
-        return;
+/// connection; when the engine holds no transaction for the session this is a
+/// no-op (`txn_rollback` errors before emitting any side effect).
+fn release_session_txn<W: Write>(eng: &Arc<RwLock<Engine<W>>>, session: u64) {
+    if let Ok(guard) = eng.read() {
+        if !guard.session_in_transaction(session) {
+            return;
+        }
     }
     if let Ok(mut guard) = eng.write() {
-        let _ = guard.execute("ROLLBACK");
+        let _ = guard.execute_session(session, "ROLLBACK");
     }
 }
 
 fn run_query<W: Write>(
     s: &mut TcpStream,
     eng: &Arc<RwLock<Engine<W>>>,
+    session: u64,
     sql: &str,
-    session_txn: &mut bool,
+    session_has_txn: &mut bool,
 ) -> std::io::Result<()> {
     // Multiple statements separated by ';' execute sequentially.
     let stmts: Vec<&str> = sql
@@ -125,12 +137,14 @@ fn run_query<W: Write>(
     }
     for st in stmts {
         let kw = st.split_whitespace().next().map(|w| w.to_ascii_uppercase());
-        // R4 transaction routing: while this session owns the engine's single
-        // explicit transaction, every statement (including SELECT) runs on the
-        // write path so the transaction's own uncommitted writes stay visible.
-        // When a *foreign* session owns it, reads still run on a committed-only
-        // snapshot and writes are rejected (single-writer constraint).
-        let foreign_txn = {
+        // R4-MULTIWRITER routing: while this session owns its own explicit
+        // transaction, every statement (including SELECT) runs on the write
+        // path so the transaction's own uncommitted writes stay visible and
+        // join the same transaction. Sessions outside a transaction read on a
+        // committed-only snapshot and write in autocommit. Multiple sessions
+        // may hold explicit transactions concurrently; row-key write conflicts
+        // surface deterministically as statement errors (no blocking).
+        let owned = {
             let guard = match eng.read() {
                 Ok(g) => g,
                 Err(_) => {
@@ -138,23 +152,23 @@ fn run_query<W: Write>(
                     return ready(s);
                 }
             };
-            guard.in_transaction() && !*session_txn
+            *session_has_txn || guard.session_in_transaction(session)
         };
-        let res = if *session_txn || foreign_txn {
-            if foreign_txn
-                && !matches!(kw.as_deref(), Some("SELECT") | Some("SHOW"))
-                && !matches!(
-                    kw.as_deref(),
-                    Some("BEGIN") | Some("COMMIT") | Some("ROLLBACK")
-                )
-            {
-                error(
-                    s,
-                    "another explicit transaction is in progress on this database \
-                     (single-writer constraint); commit or roll it back first",
-                )?;
-                break;
-            }
+        let res = if !owned && matches!(kw.as_deref(), Some("SELECT") | Some("SHOW")) {
+            // Fast path: read on a committed-only snapshot under the shared
+            // guard; never polluted by any session's uncommitted writes.
+            let guard = match eng.read() {
+                Ok(g) => g,
+                Err(_) => {
+                    error(s, "engine poisoned")?;
+                    return ready(s);
+                }
+            };
+            guard.execute_read(st)
+        } else {
+            // Write path: session-owned transaction (own-write visibility) or
+            // autocommit DML/DDL. The engine write guard serializes statement
+            // execution while leaving transactions per-session independent.
             let mut guard = match eng.write() {
                 Ok(g) => g,
                 Err(_) => {
@@ -162,42 +176,13 @@ fn run_query<W: Write>(
                     return ready(s);
                 }
             };
-            if foreign_txn {
-                // SELECT/SHOW on concurrent sessions must not be polluted by the
-                // owner's uncommitted writes, so use a committed snapshot only.
-                guard.execute_read(st)
-            } else {
-                guard.execute(st)
-            }
-        } else {
-            // No transaction anywhere: P5 keyword routing — reads on the shared
-            // guard, writes on the exclusive guard.
-            let res = if matches!(kw.as_deref(), Some("SELECT") | Some("SHOW")) {
-                let guard = match eng.read() {
-                    Ok(g) => g,
-                    Err(_) => {
-                        error(s, "engine poisoned")?;
-                        return ready(s);
-                    }
-                };
-                guard.execute_read(st)
-            } else {
-                let mut guard = match eng.write() {
-                    Ok(g) => g,
-                    Err(_) => {
-                        error(s, "engine poisoned")?;
-                        return ready(s);
-                    }
-                };
-                guard.execute(st)
-            };
-            res
+            guard.execute_session(session, st)
         };
         match res {
             Ok(res) => {
                 match kw.as_deref() {
-                    Some("BEGIN") => *session_txn = true,
-                    Some("COMMIT") | Some("ROLLBACK") => *session_txn = false,
+                    Some("BEGIN") => *session_has_txn = true,
+                    Some("COMMIT") | Some("ROLLBACK") => *session_has_txn = false,
                     _ => {}
                 }
                 if !res.columns.is_empty() {
@@ -228,14 +213,13 @@ fn run_query<W: Write>(
                 )?;
             }
             Err(e) => {
-                // R4-CONCURRENCY: a failed COMMIT or ROLLBACK ends this
-                // session's writer ownership — `txn_commit`/`txn_rollback`
-                // have already taken (and either finished or discarded) the
-                // engine's active transaction. Resetting the flag keeps the
-                // session's ownership model in sync with the engine state; the
-                // transaction is not left half-open.
+                // A failed COMMIT or ROLLBACK still ends this session's
+                // transaction — `txn_commit`/`txn_rollback` have already taken
+                // (and either finished or discarded) it. Resetting the flag
+                // keeps the session's tracking in sync with the engine state;
+                // no transaction is left half-open.
                 if matches!(kw.as_deref(), Some("COMMIT") | Some("ROLLBACK")) {
-                    *session_txn = false;
+                    *session_has_txn = false;
                 }
                 error(s, &e)?;
                 break;

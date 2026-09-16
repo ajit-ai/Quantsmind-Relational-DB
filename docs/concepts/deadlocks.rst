@@ -173,14 +173,17 @@ The SQL/MVCC write path is **no-wait only**:
   unused by the runtime.
 
 Consequently **no SQL deadlock handling is claimed**: there is nothing to
-handle at the SQL surface while it is single-writer (one explicit transaction
-at a time). The kernel-level mechanism is proven and available for a future
-multi-writer phase.
+handle at the SQL surface. Even with multi-writer sessions (R4-MULTIWRITER —
+one explicit transaction per session), the runtime writes rows only through the
+non-blocking ``try_lock`` path, so a lock wait cycle can never form; the
+kernel-level mechanism is proven and available for a runtime that ever needs to
+block.
 
 Unsupported semantics
 ---------------------
 
-* Blocking SQL writers: not enabled (SQL stays single-writer, no-wait).
+* Blocking SQL writers: not enabled (the SQL write path stays no-wait
+  ``try_lock`` even with multiple concurrent writer sessions).
 * Auto-restart of a deadlocked transaction: a ``Deadlock`` error is returned;
   the caller (future multi-writer runtime) decides to abort and retry. No
   hidden restart exists.

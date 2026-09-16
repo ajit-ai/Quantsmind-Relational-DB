@@ -9,10 +9,10 @@ verified.
 .. note::
 
    QuantsMind implements **Snapshot Isolation**, not Serializable. Everything
-   below limits itself to SI guarantees. The single-writer constraint on the
-   engine (see :doc:`transactions`) means multiple *simultaneous* writer
-   sessions are not yet supported; the visibility rules here are still proven
-   against live concurrent transactions at the kernel layer.
+   below limits itself to SI guarantees. Multiple *simultaneous* writer
+   sessions are supported (one explicit transaction per session, R4-MULTIWRITER
+   — see :doc:`transactions`); the visibility rules here are proven against
+   live concurrent transactions at the kernel layer as well.
 
 Isolation level
 ---------------
@@ -27,8 +27,8 @@ The engine and kernel provide **Snapshot Isolation**:
   transactions that both write the same key cannot both commit.
 
 Read Committed (fresh snapshot per statement) is deliberately **not** used by
-explicit transactions. Non-transactional SELECTs (autocommit and foreign
-server sessions) capture a per-statement snapshot, which is their natural
+explicit transactions. Non-transactional SELECTs (autocommit and sessions
+outside a transaction) capture a per-statement snapshot, which is their natural
 transaction boundary.
 
 Snapshot representation
@@ -161,27 +161,28 @@ Recovered MVCC state therefore preserves the same visibility contract.
 Concurrency
 -----------
 
-The kernel hosts several live transactions in one store; the SQL layer adds a
-single-writer session boundary on top of that store. Readers hold stable
-snapshots while other transactions commit, and writer conflicts are resolved
-deterministically at both layers. Writers additionally hold a strict-2PL
-exclusive lock on every row they write (see :doc:`locking`), which makes
-write-write conflicts on a live row surface immediately (``Busy``) while
-first-committer-wins still rejects stale-snapshot writes at commit. See
-:doc:`concurrency` for the full model: ownership lifecycle, conflict surfaces,
-failure cleanup, and the explicitly unsupported semantics.
+The kernel hosts several live transactions in one store; the SQL layer exposes
+that directly — one explicit transaction per session, any number of sessions
+concurrently (R4-MULTIWRITER). Readers hold stable snapshots while other
+transactions commit, and writer conflicts are resolved deterministically at
+both layers. Writers additionally hold a strict-2PL exclusive lock on every row
+they write (see :doc:`locking`), which makes write-write conflicts on a live
+row surface immediately (``Busy``) while first-committer-wins still rejects
+stale-snapshot writes at commit. See :doc:`concurrency` for the full model:
+session lifecycle, conflict surfaces, failure cleanup, and the explicitly
+unsupported semantics.
 
 Current limitation
 ------------------
 
-Concurrent foreign writers remain restricted by the existing **single-writer
-constraint** and are addressed in later R4 concurrency work. Within the SQL
-layer, a transaction that must be observed concurrently by a second session can
-only be observed by *readers* (a foreign session SELECTs the committed world
-and never the owner's uncommitted state), and foreign writes are rejected while
-a transaction is open. The SI rules that involve two overlapping writers are
+The SQL dialect is INSERT-only and append-only: each statement allocates fresh,
+disjoint physical row ids from a shared per-table counter, so two sessions'
+writes never target the same row key through SQL. The no-wait ``Busy`` and
+first-committer-wins conflict paths — and row-local isolation — are therefore
 verified directly against the kernel store, where multiple writers already
-coexist.
+coexist and can race the same row. Making those conflicts reachable through SQL
+awaits a surface that updates or deletes existing rows (or UNIQUE/PK
+constraints).
 
 Verification
 ------------

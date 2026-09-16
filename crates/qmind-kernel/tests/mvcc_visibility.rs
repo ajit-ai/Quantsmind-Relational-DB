@@ -1,10 +1,12 @@
 //! R4-MVCC — snapshot-isolation visibility contract proven at the kernel
 //! level with two live transactions in one store.
 //!
-//! The SQL engine serializes writers (single-writer constraint) so the "later
-//! committed commit stays invisible to an existing snapshot" rules can only be
-//! exercised faithfully here, where two transactions coexist in the same
-//! `MvccStore`. These tests are the behavioral contract the engine relies on:
+//! The SQL engine's statement execution is serialized by its write guard
+//! (R4-MULTIWRITER removes the old global single-writer constraint; sessions
+//! now hold concurrent explicit transactions), so the "later committed commit
+//! stays invisible to an existing snapshot" rules can only be exercised
+//! faithfully here, where two transactions coexist in the same `MvccStore`.
+//! These tests are the behavioral contract the engine relies on:
 //!
 //! Rule 1/6  own writes visible to their transaction
 //! Rule 2    foreign uncommitted writes invisible

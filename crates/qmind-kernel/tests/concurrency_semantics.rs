@@ -191,3 +191,79 @@ fn snapshot_scans_stay_stable_across_concurrent_writer_commits() {
     s.abort(r1);
     s.abort(r2);
 }
+
+/// R4-MULTIWRITER — row-local conflict granularity and fail-fast delivery.
+///
+/// Two live writer transactions hold strict-2PL locks on *rows* of the same
+/// logical table, not the table itself: a third writer can take an untouched
+/// row concurrently (row-local isolation), while a write to either held row is
+/// rejected deterministically with no-wait `Busy` — never blocked, never
+/// queued, never deadlocked. After the winner commits, a stale-snapshot writer
+/// is still rejected by first-committer-wins at commit even though the lock has
+/// been released. This is the exact conflict contract the SQL engine maps to
+/// `statement failed: row locked by another transaction`.
+#[test]
+fn row_local_conflicts_fail_fast_without_blocking_concurrent_rows() {
+    let mut s = MvccStore::new();
+
+    // All writers begin against snapshot ts=0 (stale relative to the commits
+    // below), exactly like live concurrent SQL sessions.
+    let (w1, _) = s.begin();
+    let (w2, _) = s.begin();
+    let (w3, _) = s.begin();
+    let (w4, _) = s.begin();
+    let (w5, _) = s.begin();
+
+    // Writer W1 locks rows `t/1` and `t/3` of "table" t.
+    s.set(w1, b"t/1", vec![1]).unwrap();
+    s.set(w1, b"t/3", vec![3]).unwrap();
+
+    // Row-local isolation: W2 writes row `t/2` (untouched) concurrently,
+    // despite W1 holding two other rows of the same table.
+    s.set(w2, b"t/2", vec![2]).unwrap();
+
+    // Fail-fast no-wait: W3 targets W1's held row `t/3` and is rejected
+    // immediately with Busy (no queueing, no deadlock).
+    assert!(matches!(
+        s.set(w3, b"t/3", vec![30]).unwrap_err(),
+        LockError::Busy
+    ));
+    s.abort(w3);
+    // The same for W1's other held row.
+    assert!(matches!(
+        s.set(w4, b"t/1", vec![10]).unwrap_err(),
+        LockError::Busy
+    ));
+    s.abort(w4);
+
+    // W2 (its own row) commits first; W1 commits its two rows; all three rows
+    // are present and every lock was released (strict 2PL).
+    s.commit(w2, noop).unwrap().unwrap();
+    s.commit(w1, noop).unwrap().unwrap();
+    assert_eq!(s.active_txns(), 1); // only the stale-snapshot w5 remains
+    let snap = s.snapshot();
+    assert_eq!(s.get_raw(b"t/1", &snap), Some(vec![1]));
+    assert_eq!(s.get_raw(b"t/2", &snap), Some(vec![2]));
+    assert_eq!(s.get_raw(b"t/3", &snap), Some(vec![3]));
+
+    // A stale-snapshot writer (w5, begun before W1's commit) takes the now-free
+    // row, but first-committer-wins rejects its commit: the lock being free
+    // after commit is not enough.
+    s.set(w5, b"t/3", vec![203]).unwrap();
+    let res = s.commit(w5, noop).unwrap();
+    assert_eq!(
+        res,
+        Err(Conflict {
+            key: b"t/3".to_vec()
+        })
+    );
+    s.abort(w5);
+    assert_eq!(s.active_txns(), 0);
+
+    // A fresh writer after the commit succeeds normally.
+    let (w6, _) = s.begin();
+    s.set(w6, b"t/3", vec![4]).unwrap();
+    s.commit(w6, noop).unwrap().unwrap();
+    let snap = s.snapshot();
+    assert_eq!(s.get_raw(b"t/3", &snap), Some(vec![4]));
+}

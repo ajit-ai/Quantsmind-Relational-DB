@@ -88,40 +88,40 @@ explicit transaction is open:
 
 DDL remains autocommit-only by design.
 
-Single-writer constraint
-------------------------
+One transaction per session
+---------------------------
 
-The engine serializes all writers behind a single exclusive lock, and the
-engine holds exactly **one** explicit transaction at a time. At the server
-layer, each connection is a session:
+The engine allows **one open explicit transaction per session**, and any
+number of sessions may hold one at the same time. At the server layer, each
+connection is a distinct session:
 
-* the session that issued ``BEGIN`` becomes the transaction **owner**; every
-  statement it sends — including SELECT — executes through the transaction-
-  aware write path so it observes its own uncommitted writes;
-* a **foreign session** (one that does not own the transaction) may still read:
-  its SELECTs run on committed-only snapshots and never observe the owner's
-  uncommitted state;
-* foreign **writes are rejected while a transaction is open** with a
-  deterministic ``single-writer constraint`` error, delivered before any
-  execution, so the rejected session never touches engine state and can simply
-  retry once the owner finishes;
-* a rejected writer's transaction state remains valid: it may read immediately,
-  and take over the writer slot after the owner commits, rolls back, or
-  disconnects.
+* a session that issued ``BEGIN`` owns its own transaction; every statement
+  it sends — including SELECT — executes through the transaction-aware write
+  path so it observes its own uncommitted writes;
+* that same session cannot ``BEGIN`` again until its transaction ends
+  (deterministic ``a transaction is already in progress`` error);
+* a **different session** may ``BEGIN`` at any time — even while another
+  session's transaction is open — and runs an independent transaction with
+  its own snapshot, pending writes and row locks;
+* sessions outside a transaction read on committed-only snapshots: their
+  SELECTs never observe any session's uncommitted state, and their writes run
+  in autocommit.
 
-Writer ownership is released — deterministically — by:
+A session's transaction is released — deterministically — by:
 
 * ``COMMIT``,
 * ``ROLLBACK``,
 * a failed ``COMMIT`` / ``ROLLBACK`` (the engine has already taken or discarded
-  the active transaction),
-* **session termination**: a connection that closes while owning an open
+  the session's transaction),
+* **session termination**: a connection that closes while holding an open
   transaction (Terminate packet or TCP disconnect) has it rolled back
-  automatically, so a later session can always acquire the writer slot.
+  automatically, so its row locks are released and other sessions are never
+  blocked.
 
-A failed *statement* inside a transaction does **not** release ownership: the
-transaction continues and the owner keeps it until ``COMMIT`` / ``ROLLBACK``.
-Ownership never becomes permanently stuck.
+A failed *statement* inside a transaction does **not** release the transaction:
+it continues within that session, and other sessions' transactions are
+unaffected either way. A session's transaction state never becomes permanently
+stuck.
 
 Readers are not blocked: the read snapshot path runs lock-free on committed
 data. See :doc:`concurrency` for the full concurrency model, the conflict
@@ -130,11 +130,11 @@ surfaces, and the explicitly unsupported semantics.
 Columnar (HTAP) interplay
 -------------------------
 
-Autocommit and foreign SELECTs prefer the columnar read path when columnar
-segments exist for a table. Inside an explicit transaction, SELECT reads the
-transaction-aware MVCC row store instead, so the transaction's own buffered
-rows are visible alongside all committed rows (the row store retains committed
-rows even after columnar flushes).
+Autocommit SELECTs and reads by sessions outside a transaction prefer the
+columnar read path when columnar segments exist for a table. Inside an explicit
+transaction, SELECT reads the transaction-aware MVCC row store instead, so the
+transaction's own buffered rows are visible alongside all committed rows (the
+row store retains committed rows even after columnar flushes).
 
 Row-id gaps
 -----------
@@ -151,18 +151,20 @@ Errors and recovery
 * Commit failures (WAL errors) abort the transaction before any row is
   published.
 * Every row a transaction writes is exclusively locked from the first write
-  until commit/abort (strict 2PL, see :doc:`locking`). At the SQL layer the
-  single-writer gate means these locks never collide; at the kernel layer a
-  live lock conflict rejects the requester immediately, and the losing
+  until commit/abort (strict 2PL, see :doc:`locking`). In the current INSERT-only
+  dialect two sessions write disjoint physical rows, so row locks effectively
+  never collide between SQL sessions; at the kernel layer a live lock conflict
+  rejects the requester immediately (``LockError::Busy``), and the losing
   transaction rolls back cleanly.
 * Write-write conflicts fail with ``first-committer-wins`` semantics
   (``transaction aborted: write-write conflict ...``) and the losing
   transaction is rolled back cleanly.
 * Deadlock detection is a **kernel** property of the lock manager's blocking
   ``acquire`` path (no-wait victim = the requester). Because the SQL runtime
-  uses only the no-wait ``try_lock`` path and is single-writer, a lock cycle
-  can never form at the SQL layer — there is no SQL deadlock to handle. See
-  :doc:`deadlocks`.
+  uses only the no-wait ``try_lock`` path — and multi-writer statements still
+  serialize statement-by-statement through the engine write guard — a lock
+  cycle can never form at the SQL layer: there is no SQL deadlock to handle.
+  See :doc:`deadlocks`.
 * After a crash, recovery rebuilds the committed world from the WAL; committed
   transactions stay visible, and in-flight / rolled-back / aborted state stays
   absent.

@@ -53,11 +53,15 @@ writers can actually collide:
 * Reads and snapshots take **no locks**: a snapshot is an immutable watermark
   and scans run lock-free, so readers never contend with writers.
 
-The SQL layer is single-writer by design (see :doc:`transactions`): the
-session gate and the engine write guard serialize writers, so at the SQL
-surface locks can never collide. The row locks are the kernel's defense for
-the store's own multi-writer API — they are exercised and proven
-deterministically at the kernel level.
+The SQL layer hosts **one explicit transaction per session, with any number of
+sessions concurrently** (see :doc:`transactions`). Statements serialize through
+the engine's write guard, but the transactions — and their row locks — are
+independent. In the current INSERT-only dialect each statement allocates fresh,
+disjoint physical row ids from a shared counter, so two sessions' SQL writes
+never collide on a key; row locks are the kernel's defense for the store's own
+multi-writer API and are exercised and proven deterministically at the kernel
+level, including row-local granularity (a writer to a held row is rejected
+immediately while other rows of the same table stay writable).
 
 Row keys map 1:1 to resources via ``String::from_utf8_lossy(key)``. Row keys
 are UTF-8 (ASCII table name, ``\x01`` separator, decimal row id), so the

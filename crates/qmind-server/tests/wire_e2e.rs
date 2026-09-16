@@ -205,7 +205,7 @@ fn transaction_session_sees_own_writes_others_see_committed_only() {
 }
 
 #[test]
-fn foreign_writes_blocked_while_transaction_held() {
+fn foreign_writes_are_not_blocked_while_a_transaction_is_held() {
     let port = start_server();
     let mut c1 = connect(port);
     query(&mut c1, "CREATE TABLE txn_t2 (id INTEGER);");
@@ -213,20 +213,22 @@ fn foreign_writes_blocked_while_transaction_held() {
     query(&mut c1, "BEGIN;");
     query(&mut c1, "INSERT INTO txn_t2 VALUES (1);");
 
-    // Foreign write is rejected while the owner holds the transaction.
+    // R4-MULTIWRITER: a foreign session's write is no longer rejected — it
+    // runs in autocommit on a disjoint physical row while the owner's
+    // transaction stays open.
     let mut c2 = connect(port);
-    let err = query_result(&mut c2, "INSERT INTO txn_t2 VALUES (2);").unwrap_err();
-    assert!(
-        err.contains("single-writer constraint"),
-        "expected single-writer rejection, got: {err}"
-    );
-    // Foreign reads still work on a committed-only snapshot.
-    let rows = query(&mut c2, "SELECT COUNT(*) FROM txn_t2;");
-    assert_eq!(rows, vec![vec!["0".to_string()]]);
-
-    // Owner rolls back; foreign writer is unblocked.
-    query(&mut c1, "ROLLBACK;");
     query(&mut c2, "INSERT INTO txn_t2 VALUES (2);");
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM txn_t2;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    // The owner still sees only its own row (snapshot isolation).
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM txn_t2;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    // Rollback removes only the owner's row; the foreign writer's survives.
+    query(&mut c1, "ROLLBACK;");
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM txn_t2;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
     let rows = query(&mut c1, "SELECT COUNT(*) FROM txn_t2;");
     assert_eq!(rows, vec![vec!["1".to_string()]]);
 }
@@ -264,7 +266,7 @@ fn foreign_session_never_sees_uncommitted_owner_rows() {
 }
 
 #[test]
-fn owner_snapshot_view_is_stable_while_transaction_held() {
+fn owner_snapshot_view_is_stable_while_foreign_writer_commits() {
     let port = start_server();
     let mut c1 = connect(port);
     query(&mut c1, "CREATE TABLE stab (id INTEGER);");
@@ -274,13 +276,14 @@ fn owner_snapshot_view_is_stable_while_transaction_held() {
     let before = query(&mut c1, "SELECT COUNT(*) FROM stab;");
     assert_eq!(before, vec![vec!["3".to_string()]]);
 
-    // A foreign writer is rejected under the single-writer constraint, so no
-    // committed change can land between two reads: the owner's snapshot view
-    // is stable exactly because the engine pins the BEGIN-time snapshot and
-    // the writer gate prevents any interleaved commit.
+    // A foreign writer commits a new row while the owner's transaction is
+    // open. The owner's pinned BEGIN-time snapshot must not observe it.
     let mut c2 = connect(port);
-    let err = query_result(&mut c2, "INSERT INTO stab VALUES (9);").unwrap_err();
-    assert!(err.contains("single-writer constraint"), "{err}");
+    query(&mut c2, "INSERT INTO stab VALUES (9);");
+    assert_eq!(
+        query(&mut c2, "SELECT COUNT(*) FROM stab;"),
+        vec![vec!["4".to_string()]]
+    );
 
     let after = query(&mut c1, "SELECT COUNT(*) FROM stab;");
     assert_eq!(
@@ -290,12 +293,9 @@ fn owner_snapshot_view_is_stable_while_transaction_held() {
 
     query(&mut c1, "COMMIT;");
 
-    // A fresh transaction on the same session sees the unblocked world.
-    query(&mut c2, "INSERT INTO stab VALUES (4);");
-    query(&mut c1, "BEGIN;");
+    // After COMMIT a fresh statement on the same session sees the foreign row.
     let rows = query(&mut c1, "SELECT COUNT(*) FROM stab;");
     assert_eq!(rows, vec![vec!["4".to_string()]]);
-    query(&mut c1, "COMMIT;");
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn rolled_back_owner_rows_invisible_to_foreign_session() {
 }
 
 #[test]
-fn disconnected_owner_releases_writer_ownership() {
+fn disconnected_owner_transaction_is_rolled_back_and_others_unaffected() {
     let port = start_server();
     let mut c1 = connect(port);
     query(&mut c1, "CREATE TABLE owned (id INTEGER);");
@@ -333,38 +333,32 @@ fn disconnected_owner_releases_writer_ownership() {
     query(&mut c1, "INSERT INTO owned VALUES (1);");
     drop(c1);
 
-    // The server must roll the abandoned transaction back asynchronously.
+    // The server must roll the abandoned transaction back asynchronously; the
+    // row must disappear and no other session may ever be blocked by it. The
+    // rollback happens on the server's connection thread, so poll until it
+    // lands (bounded retries, no sleeps).
     let mut c2 = connect(port);
-    let rows = query(&mut c2, "SELECT COUNT(*) FROM owned;");
-    assert_eq!(rows, vec![vec!["0".to_string()]]);
-
-    // Writer ownership is released, so a later writer can take over. The
-    // rollback happens on the server's connection thread, so retry the write
-    // until the ownership releases (bounded retries, no sleeps).
-    let mut inserted = false;
+    let mut gone = false;
     for _ in 0..200 {
-        match query_result(&mut c2, "INSERT INTO owned VALUES (2);") {
-            Ok(_) => {
-                inserted = true;
-                break;
-            }
-            Err(e) => assert!(
-                e.contains("single-writer constraint"),
-                "unexpected rejection: {e}"
-            ),
+        let rows = query(&mut c2, "SELECT COUNT(*) FROM owned;");
+        if rows == vec![vec!["0".to_string()]] {
+            gone = true;
+            break;
         }
     }
-    assert!(inserted, "writer ownership never released after disconnect");
+    assert!(gone, "abandoned transaction was never rolled back");
+
+    // Under multi-writer the foreign session could always write anyway; prove
+    // the abandoned transaction left no trace and both commits coexist.
+    query(&mut c2, "BEGIN;");
+    query(&mut c2, "INSERT INTO owned VALUES (2);");
+    query(&mut c2, "COMMIT;");
     let rows = query(&mut c2, "SELECT COUNT(*) FROM owned;");
-    assert_eq!(
-        rows,
-        vec![vec!["1".to_string()]],
-        "only the post-rollback write committed"
-    );
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
 }
 
 #[test]
-fn failed_statement_holds_ownership_until_rollback_then_releases() {
+fn failed_statement_keeps_only_its_own_session_transaction_open() {
     let port = start_server();
     let mut c1 = connect(port);
     query(&mut c1, "CREATE TABLE fail_t (id INTEGER, v TEXT);");
@@ -375,53 +369,65 @@ fn failed_statement_holds_ownership_until_rollback_then_releases() {
     let err = query_result(&mut c1, "INSERT INTO fail_t VALUES (2);").unwrap_err();
     assert!(err.contains("has 2 columns"), "unexpected error: {err}");
 
-    // Statement failure does not end the transaction: ownership is still held,
-    // so a foreign writer stays rejected under the single-writer constraint.
-    let mut c2 = connect(port);
-    let err = query_result(&mut c2, "INSERT INTO fail_t VALUES (3, 'foreign');").unwrap_err();
-    assert!(err.contains("single-writer constraint"), "{err}");
+    // Statement failure does not end this session's transaction: its earlier
+    // write is still visible to it.
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM fail_t;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
 
-    // Ownership is released by ROLLBACK; the foreign writer can now proceed,
-    // and the owner's earlier write is gone (no partial state persisted).
-    query(&mut c1, "ROLLBACK;");
+    // R4-MULTIWRITER: a foreign writer is unaffected either way — it commits
+    // on its own disjoint row while the owner's transaction stays open.
+    let mut c2 = connect(port);
     query(&mut c2, "INSERT INTO fail_t VALUES (3, 'foreign');");
     let rows = query(&mut c1, "SELECT COUNT(*) FROM fail_t;");
     assert_eq!(
         rows,
         vec![vec!["1".to_string()]],
+        "owner snapshot stays pinned"
+    );
+
+    // ROLLBACK discards only the owner's row; the foreign write survives.
+    query(&mut c1, "ROLLBACK;");
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM fail_t;");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
         "rolled-back owner row must not survive"
     );
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM fail_t;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
 }
 
 #[test]
-fn ownership_flows_between_sessions_only_via_terminal_statement() {
+fn two_sessions_hold_concurrent_transactions_and_commit_independently() {
     let port = start_server();
     let mut c1 = connect(port);
     query(&mut c1, "CREATE TABLE flow (id INTEGER);");
 
-    // Session 1 acquires writer ownership.
+    // Session 1 acquires a writer transaction and inserts a row.
     query(&mut c1, "BEGIN;");
     query(&mut c1, "INSERT INTO flow VALUES (1);");
 
-    // Session 2's concurrent BEGIN is deterministically rejected: the engine's
-    // single explicit transaction is already owned.
+    // R4-MULTIWRITER: session 2 may now BEGIN concurrently (no rejection).
     let mut c2 = connect(port);
-    let err = query_result(&mut c2, "BEGIN;").unwrap_err();
-    assert!(
-        err.contains("write connection"),
-        "foreign BEGIN must be rejected, got: {err}"
-    );
-    // ...and its writes are blocked too.
-    let err = query_result(&mut c2, "INSERT INTO flow VALUES (2);").unwrap_err();
-    assert!(err.contains("single-writer constraint"), "{err}");
-
-    // Owner COMMIT transfers ownership; session 2 takes over and commits.
-    query(&mut c1, "COMMIT;");
     query(&mut c2, "BEGIN;");
     query(&mut c2, "INSERT INTO flow VALUES (2);");
-    query(&mut c2, "COMMIT;");
 
-    // Both sessions' committed rows are present; neither transaction wedged.
+    // Each session sees only its own uncommitted row.
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM flow;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM flow;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    // Commit in any order; both sessions' rows are durable and visible after
+    // both commits.
+    query(&mut c1, "COMMIT;");
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM flow;");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "c2 snapshot still pinned"
+    );
+    query(&mut c2, "COMMIT;");
     let rows = query(&mut c1, "SELECT COUNT(*) FROM flow;");
     assert_eq!(rows, vec![vec!["2".to_string()]]);
     let rows = query(&mut c2, "SELECT COUNT(*) FROM flow;");
@@ -502,4 +508,75 @@ fn handshaken_reader_never_observes_open_explicit_transaction() {
     assert_eq!(rows.len(), 101, "committed groups become visible");
     let rows = query(&mut c1, "SELECT id FROM hand JOIN grp ON id = gid;");
     assert_eq!(rows.len(), 101, "committed JOIN rows become visible");
+}
+
+#[test]
+fn wire_interleaved_multirow_explicit_writers_both_commit() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE mw (id INTEGER, owner TEXT);");
+
+    // Two sessions interleave multi-row INSERTs inside concurrent explicit
+    // transactions targeting the same table. Physical row ids come from the
+    // engine's shared counter, so every statement reserves a disjoint range:
+    // neither transaction ever blocks the other and both commit.
+    query(&mut c1, "BEGIN;");
+    query(&mut c1, "INSERT INTO mw VALUES (1, 'c1'), (2, 'c1');");
+    let mut c2 = connect(port);
+    query(&mut c2, "BEGIN;");
+    query(&mut c2, "INSERT INTO mw VALUES (100, 'c2'), (101, 'c2');");
+    query(&mut c1, "INSERT INTO mw VALUES (3, 'c1');");
+    query(&mut c2, "INSERT INTO mw VALUES (102, 'c2');");
+
+    // Each session sees its own rows only (snapshot isolation over writers).
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM mw;");
+    assert_eq!(rows, vec![vec!["3".to_string()]]);
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM mw;");
+    assert_eq!(rows, vec![vec!["3".to_string()]]);
+
+    query(&mut c1, "COMMIT;");
+    query(&mut c2, "COMMIT;");
+
+    let rows = query(&mut c1, "SELECT id FROM mw ORDER BY id;");
+    let got: Vec<String> = rows.iter().map(|r| r[0].clone()).collect();
+    assert_eq!(
+        got,
+        vec!["1", "2", "3", "100", "101", "102"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>(),
+        "both sessions' interleaved rows committed exactly once"
+    );
+}
+
+#[test]
+fn rollback_in_one_wire_session_does_not_disturb_the_other() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE rb2 (id INTEGER, v TEXT);");
+
+    query(&mut c1, "BEGIN;");
+    query(&mut c1, "INSERT INTO rb2 VALUES (1, 'doomed');");
+    let mut c2 = connect(port);
+    query(&mut c2, "BEGIN;");
+    query(&mut c2, "INSERT INTO rb2 VALUES (2, 'kept');");
+
+    // The other session stays healthy throughout the first session's rollback.
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM rb2;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    query(&mut c1, "ROLLBACK;");
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM rb2;");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "session 2 unaffected by session 1's rollback"
+    );
+    query(&mut c2, "COMMIT;");
+    let rows = query(&mut c1, "SELECT id, v FROM rb2;");
+    assert_eq!(
+        rows,
+        vec![vec!["2".to_string(), "kept".to_string()]],
+        "only session 2's committed row survives"
+    );
 }

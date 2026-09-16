@@ -61,12 +61,23 @@ pub struct Engine<W: Write> {
     /// R3: optional persistent table storage (file-backed engines only).
     /// Populated by `create_db` / `open_db`; `None` for in-memory `Engine`.
     storage: Option<StorageManager<FilePageStore>>,
-    /// R4: the one explicit transaction currently open on this engine, if any.
-    /// The engine serializes writers (`&mut self`), so at most one explicit
-    /// transaction can be active at any moment; concurrent readers stay
+    /// R4-MULTIWRITER: the explicit transactions currently open on this
+    /// engine, keyed by session. Multiple sessions may hold concurrent explicit
+    /// transactions: each carries its own kernel txn id, snapshot, row locks
+    /// (strict 2PL) and buffered rows. Statement execution is still serialized
+    /// by `&mut self` (and the server's engine write guard), but transactions
+    /// themselves live independently — any subset may roll back or commit
+    /// (first-committer-wins on actual key overlap, which the append-only
+    /// row-id allocation keeps disjoint). Session 0 is the embedded/default
+    /// session used by [`execute`](Self::execute). Concurrent readers stay
     /// lock-free via `execute_read` snapshots.
-    active: Option<ActiveTxn>,
+    active: HashMap<SessionId, ActiveTxn>,
 }
+
+/// Identity of a database session. The embedded API ([`Engine::execute`]) uses
+/// session 0; the wire server assigns each connection a unique id so every
+/// connection can hold its own explicit transaction concurrently.
+pub type SessionId = u64;
 
 /// One buffered insert row inside an explicit transaction. Secondary index
 /// entries, columnar deltas, and persistent page rows are all materialized
@@ -118,7 +129,7 @@ impl<W: Write> Engine<W> {
             delta_applier: None,
             columnar_flush_threshold: 10_000,
             storage: None,
-            active: None,
+            active: HashMap::new(),
         }
     }
 
@@ -191,7 +202,9 @@ impl<W: Write> Engine<W> {
             .collect())
     }
 
-    /// Parse + execute a single statement.
+    /// Parse + execute a single statement on the embedded default session
+    /// (session 0). See [`execute_session`](Self::execute_session) for the
+    /// session-aware form used by the wire server.
     ///
     /// R4: transaction-control statements (`BEGIN`, `COMMIT`, `ROLLBACK`)
     /// drive the engine's explicit transaction. With an explicit transaction
@@ -199,6 +212,16 @@ impl<W: Write> Engine<W> {
     /// (it is autocommit by design and cannot be rolled back). Without one,
     /// every statement remains autocommit.
     pub fn execute(&mut self, sql: &str) -> Result<ExecResult, String> {
+        self.execute_session(0, sql)
+    }
+
+    /// Parse + execute a single statement on behalf of `session` (one active
+    /// explicit transaction per session; multiple sessions may be active
+    /// concurrently). Statement execution is serialized by `&mut self`, but the
+    /// session's transaction — snapshot, pending writes and strict-2PL row
+    /// locks — is independent of every other session's, so two sessions can
+    /// write, roll back and commit concurrently without interfering.
+    pub fn execute_session(&mut self, session: SessionId, sql: &str) -> Result<ExecResult, String> {
         let stmts = parser::Parser::parse(sql)?;
         if stmts.len() != 1 {
             return Err(format!(
@@ -207,13 +230,13 @@ impl<W: Write> Engine<W> {
             ));
         }
         match &stmts[0] {
-            Statement::Begin => self.txn_begin(),
-            Statement::Commit => self.txn_commit(),
-            Statement::Rollback => self.txn_rollback(),
+            Statement::Begin => self.txn_begin(session),
+            Statement::Commit => self.txn_commit(session),
+            Statement::Rollback => self.txn_rollback(session),
             Statement::CreateTable { .. }
             | Statement::CreateIndex { .. }
             | Statement::DropIndex { .. }
-                if self.active.is_some() =>
+                if self.active.contains_key(&session) =>
             {
                 Err("DDL is not supported inside an explicit transaction; \
                      commit or roll back first"
@@ -224,9 +247,9 @@ impl<W: Write> Engine<W> {
                 columns,
                 if_not_exists,
             } => self.create_table(name, columns, *if_not_exists),
-            Statement::Insert { table, rows } => self.insert(table, rows),
+            Statement::Insert { table, rows } => self.insert(session, table, rows),
             Statement::Select(sel) => {
-                let (snap, txn) = match &self.active {
+                let (snap, txn) = match self.active.get(&session) {
                     Some(a) => (a.snap, Some(a.txn)),
                     None => (self.db.snapshot(), None),
                 };
@@ -242,28 +265,37 @@ impl<W: Write> Engine<W> {
         }
     }
 
-    /// True when an explicit `BEGIN` transaction is currently open on this
-    /// engine (the server uses this to route a session's statements through
-    /// the write path so they observe the transaction's own writes).
+    /// True when `session` holds an explicit `BEGIN` transaction (the wire
+    /// server uses this to route a session's statements through the write path
+    /// so they observe the transaction's own writes).
+    pub fn session_in_transaction(&self, session: SessionId) -> bool {
+        self.active.contains_key(&session)
+    }
+
+    /// True when the embedded default session (0) holds an explicit
+    /// `BEGIN` transaction.
     pub fn in_transaction(&self) -> bool {
-        self.active.is_some()
+        self.active.contains_key(&0)
     }
 
     // ── R4 transaction control ───────────────────────────────────────────────
 
-    /// BEGIN — allocate a kernel transaction and snapshot. No WAL record is
-    /// emitted yet: this engine uses deferred commit logging, so an
-    /// explicit transaction only reaches the WAL atomically at COMMIT.
-    fn txn_begin(&mut self) -> Result<ExecResult, String> {
-        if self.active.is_some() {
+    /// BEGIN — allocate a kernel transaction and snapshot for `session`. No
+    /// WAL record is emitted yet: this engine uses deferred commit logging, so
+    /// an explicit transaction only reaches the WAL atomically at COMMIT.
+    fn txn_begin(&mut self, session: SessionId) -> Result<ExecResult, String> {
+        if self.active.contains_key(&session) {
             return Err("a transaction is already in progress".into());
         }
         let (txn, snap) = self.db.begin();
-        self.active = Some(ActiveTxn {
-            txn,
-            snap,
-            buffered: Vec::new(),
-        });
+        self.active.insert(
+            session,
+            ActiveTxn {
+                txn,
+                snap,
+                buffered: Vec::new(),
+            },
+        );
         Ok(ExecResult::empty())
     }
 
@@ -272,8 +304,8 @@ impl<W: Write> Engine<W> {
     /// MVCC, then materialize indexes/columnar/page-store rows in write-ahead
     /// order. On a write-write conflict the loser is aborted per
     /// first-committer-wins.
-    fn txn_commit(&mut self) -> Result<ExecResult, String> {
-        let Some(act) = self.active.take() else {
+    fn txn_commit(&mut self, session: SessionId) -> Result<ExecResult, String> {
+        let Some(act) = self.active.remove(&session) else {
             return Err("no transaction in progress".into());
         };
         let count = self.finish_commit(act.txn, act.buffered)?;
@@ -289,8 +321,8 @@ impl<W: Write> Engine<W> {
     /// nothing was applied to indexes/columnar/pages during the transaction,
     /// abort is a pure in-memory discard; an `Abort` record is written for an
     /// auditable transaction boundary.
-    fn txn_rollback(&mut self) -> Result<ExecResult, String> {
-        let Some(act) = self.active.take() else {
+    fn txn_rollback(&mut self, session: SessionId) -> Result<ExecResult, String> {
+        let Some(act) = self.active.remove(&session) else {
             return Err("no transaction in progress".into());
         };
         self.db.abort(act.txn);
@@ -515,7 +547,12 @@ impl<W: Write> Engine<W> {
         Ok(ExecResult::empty())
     }
 
-    fn insert(&mut self, table: &str, rows: &[Vec<Expr>]) -> Result<ExecResult, String> {
+    fn insert(
+        &mut self,
+        session: SessionId,
+        table: &str,
+        rows: &[Vec<Expr>],
+    ) -> Result<ExecResult, String> {
         let schema = self
             .tables
             .get(table)
@@ -570,7 +607,7 @@ impl<W: Write> Engine<W> {
         // — a conflict fails the statement before any pending write lands, so
         // a failed statement leaves no partial row state. The subsequent
         // writes are re-entrant on the reserved locks.
-        if let Some(act) = self.active.as_mut() {
+        if let Some(act) = self.active.get_mut(&session) {
             for b in &buffered {
                 self.db
                     .lock_write(act.txn, &row_key(table, b.rid))
@@ -1751,7 +1788,7 @@ impl Engine<std::fs::File> {
             delta_applier: None,
             columnar_flush_threshold: 10_000,
             storage: Some(storage),
-            active: None,
+            active: HashMap::new(),
         })
     }
 
@@ -1915,7 +1952,7 @@ impl Engine<std::fs::File> {
             delta_applier: None,
             columnar_flush_threshold: 10_000,
             storage: Some(storage),
-            active: None,
+            active: HashMap::new(),
         })
     }
 
