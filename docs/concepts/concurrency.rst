@@ -99,8 +99,10 @@ Three conflict surfaces exist, at different layers:
 * **SQL session (single-writer gate).** A foreign writer is rejected up front,
   before it can affect any engine state.
 
-The kernel conflict paths are proven deterministically (``concurrency_semantics``
-and ``lock_2pl`` kernel tests); the SQL path is proven over real TCP sessions.
+The kernel conflict paths are proven deterministically (``concurrency_semantics``,
+``lock_2pl``, and ``deadlock`` kernel tests); the SQL path is proven over real
+TCP sessions. The kernel's blocking wait queues and DFS deadlock detection are
+a validated but runtime-unused capability — see :doc:`deadlocks`.
 
 Writer ownership lifecycle
 --------------------------
@@ -189,8 +191,9 @@ The current implementation does **not** provide:
   advances mid-transaction);
 * **blocking write waits** — the SQL/MVCC write path always uses the
   deterministic no-wait row-lock path (``LockManager::try_lock``). The lock
-  manager's blocking FIFO-queue ``acquire`` with deadlock detection remains an
-  available API capability but is deliberately *not* used by the runtime,
-  which chooses immediate rejection over waiting.
+  manager's blocking FIFO-queue ``acquire`` with deadlock detection is a
+  validated kernel capability (see :doc:`deadlocks`) but is deliberately *not*
+  used by the runtime, which chooses immediate rejection over waiting — so no
+  SQL deadlock handling exists or is claimed.
 
 Progress on any of these is a separate R4 phase, not a property of this one.

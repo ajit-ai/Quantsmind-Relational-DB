@@ -20,6 +20,7 @@ architecture decision records behind the R3 choices.
    R4_MVCC_COMPLETION_REPORT
    R4_CONCURRENCY_COMPLETION_REPORT
    R4_LOCK_COMPLETION_REPORT
+   R4_DEADLOCK_COMPLETION_REPORT
 
 Architecture decision records (ADRs)
 ------------------------------------

@@ -104,9 +104,22 @@ Conflict semantics
   even if the lock was already released (a stale-snapshot write). The two
   mechanisms are complementary — locks prevent concurrent holds, MVCC rejects
   stale overwrites.
-* The runtime never uses the blocking ``acquire`` path; deadlock detection
-  stays an API capability of the lock manager and is not exercised by the
+* The runtime never uses the blocking ``acquire`` path; the blocking FIFO
+  wait queues, waits-for graph, and DFS deadlock detection are validated and
+  documented in :doc:`deadlocks`, and stay an unused API capability of the
   SQL/MVCC write path.
+
+Blocking acquisition and deadlock detection
+-------------------------------------------
+
+``acquire`` — the classic queue-based path — coexists with ``try_lock`` but is
+never called by the runtime. A blocking request that cannot grant immediately
+queues FIFO, records waits-for edges, and runs a DFS cycle check per edge
+addition; a cycle fails the requester with ``LockError::Deadlock { cycle }``
+(no-wait victim = the requester), and full termination cleanup purges the
+victim's queued requests and sweeps its incoming wait edges. The semantics,
+victim policy, cleanup guarantees, MVCC independence, and the strict SQL
+no-wait boundary are specified in :doc:`deadlocks`.
 
 MVCC interaction
 ----------------
@@ -145,9 +158,12 @@ Test coverage
   first-committer-wins after lock release, WAL-failure auto-reap,
   reserve-all-then-write, distinct keys never conflict, same-row re-entrant
   writes, lock-free snapshot reads beside a locked writer.
-* ``crates/qmind-kernel/src/lock.rs`` unit tests (+3): ``try_lock`` conflict
+* ``crates/qmind-kernel/tests/deadlock.rs`` (new, 12 tests): deadlock
+  detection, wait chains, cancellation, and cleanup — see :doc:`deadlocks`.
+* ``crates/qmind-kernel/src/lock.rs`` unit tests: ``try_lock`` conflict
   rejection without queueing, shared coexistence + re-entry, sole-holder
-  upgrade.
+  upgrade (+3, R4-LOCK); aborted-waiter queue purge, terminated-txn wait-set
+  sweep, multi-resource waiter edge retention (+3, R4-DEADLOCK).
 * ``crates/qmind-kernel/tests/correctness.rs`` (updated property test): a
   randomized serial-history model now treats a ``Busy`` set as a deterministic
   immediate abort.

@@ -158,6 +158,11 @@ Errors and recovery
 * Write-write conflicts fail with ``first-committer-wins`` semantics
   (``transaction aborted: write-write conflict ...``) and the losing
   transaction is rolled back cleanly.
+* Deadlock detection is a **kernel** property of the lock manager's blocking
+  ``acquire`` path (no-wait victim = the requester). Because the SQL runtime
+  uses only the no-wait ``try_lock`` path and is single-writer, a lock cycle
+  can never form at the SQL layer — there is no SQL deadlock to handle. See
+  :doc:`deadlocks`.
 * After a crash, recovery rebuilds the committed world from the WAL; committed
   transactions stay visible, and in-flight / rolled-back / aborted state stays
   absent.

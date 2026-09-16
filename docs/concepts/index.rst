@@ -16,3 +16,4 @@ durability and recovery machinery works).
    transactions
    concurrency
    locking
+   deadlocks
