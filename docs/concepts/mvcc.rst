@@ -164,9 +164,12 @@ Concurrency
 The kernel hosts several live transactions in one store; the SQL layer adds a
 single-writer session boundary on top of that store. Readers hold stable
 snapshots while other transactions commit, and writer conflicts are resolved
-deterministically at both layers. See :doc:`concurrency` for the full model:
-ownership lifecycle, conflict surfaces, failure cleanup, and the explicitly
-unsupported semantics.
+deterministically at both layers. Writers additionally hold a strict-2PL
+exclusive lock on every row they write (see :doc:`locking`), which makes
+write-write conflicts on a live row surface immediately (``Busy``) while
+first-committer-wins still rejects stale-snapshot writes at commit. See
+:doc:`concurrency` for the full model: ownership lifecycle, conflict surfaces,
+failure cleanup, and the explicitly unsupported semantics.
 
 Current limitation
 ------------------

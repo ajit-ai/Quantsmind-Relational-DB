@@ -20,7 +20,13 @@ pub enum LockMode {
 
 #[derive(Debug)]
 pub enum LockError {
-    Deadlock { cycle: Vec<u64> },
+    Deadlock {
+        cycle: Vec<u64>,
+    },
+    /// A no-wait request was rejected because another transaction holds the
+    /// resource in an incompatible mode. Nothing was enqueued; the caller may
+    /// retry later (R4-LOCK deterministic, non-blocking conflict).
+    Busy,
 }
 
 #[derive(Debug, Default)]
@@ -101,6 +107,42 @@ impl LockManager {
             return Err(LockError::Deadlock { cycle });
         }
         Ok(())
+    }
+
+    /// Deterministic no-wait acquisition for the SQL/MVCC write path.
+    ///
+    /// Grants immediately when the request is compatible with the current
+    /// holders (mirroring `acquire`'s grant rule) and otherwise returns
+    /// [`LockError::Busy`] without touching the FIFO queue or the waits-for
+    /// graph — a no-wait request can never wait, so it can never create a
+    /// deadlock cycle. This is how the kernel surfaces a write-write conflict
+    /// at `set` time instead of blocking a single-threaded runtime. Re-entrant
+    /// requests (same or stronger mode already held) succeed; upgrades are
+    /// granted to a sole holder like `acquire`.
+    pub fn try_lock(&mut self, txn: u64, res: Resource, mode: LockMode) -> Result<(), LockError> {
+        let entry = self.locks.entry(res).or_default();
+
+        if let Some(&held) = entry.holders.get(&txn) {
+            if held == mode || held == LockMode::Exclusive {
+                return Ok(()); // already sufficient
+            }
+            // S -> X upgrade by sole holder is a direct grant.
+            if entry.holders.len() == 1 {
+                entry.holders.insert(txn, mode);
+                return Ok(());
+            }
+            return Err(LockError::Busy);
+        }
+
+        let compatible = entry.holders.is_empty()
+            || (mode == LockMode::Shared
+                && entry.holders.values().all(|&m| m == LockMode::Shared)
+                && entry.queue.is_empty());
+        if compatible {
+            entry.holders.insert(txn, mode);
+            return Ok(());
+        }
+        Err(LockError::Busy)
     }
 
     /// DFS from `start` following waits_for; returns the cycle containing
@@ -238,6 +280,7 @@ mod tests {
                 assert_eq!(cycle.last(), Some(&2));
                 assert!(cycle.contains(&1));
             }
+            LockError::Busy => panic!("blocking acquire must not return Busy"),
         }
         // requester's request rolled back — 2 still holds only b
         assert_eq!(lm.holds(2, &res("b")), Some(LockMode::Exclusive));
@@ -277,5 +320,49 @@ mod tests {
             Some(LockMode::Exclusive),
             "promoted after release"
         );
+    }
+
+    #[test]
+    fn try_lock_grants_frees_and_rejects_conflicts_without_queueing() {
+        let mut lm = LockManager::new();
+        lm.try_lock(1, res("t"), LockMode::Exclusive).unwrap();
+        // Incompatible requests fail immediately — no FIFO entry, no wait.
+        assert!(matches!(
+            lm.try_lock(2, res("t"), LockMode::Exclusive).unwrap_err(),
+            LockError::Busy
+        ));
+        assert!(matches!(
+            lm.try_lock(3, res("t"), LockMode::Shared).unwrap_err(),
+            LockError::Busy
+        ));
+        assert!(
+            lm.holds(2, &res("t")).is_none(),
+            "nothing granted to waiter"
+        );
+        // Holder releases (strict 2PL commit/abort) — the no-wait requester
+        // can now proceed without a stale queue entry getting in the way.
+        lm.release_all(1);
+        lm.try_lock(2, res("t"), LockMode::Exclusive).unwrap();
+        assert_eq!(lm.holds(2, &res("t")), Some(LockMode::Exclusive));
+    }
+
+    #[test]
+    fn try_lock_shared_coexists_and_same_txn_reentry_succeeds() {
+        let mut lm = LockManager::new();
+        lm.try_lock(1, res("t"), LockMode::Shared).unwrap();
+        lm.try_lock(2, res("t"), LockMode::Shared).unwrap();
+        // Re-entrant requests are satisfied by the existing hold.
+        lm.try_lock(1, res("t"), LockMode::Shared).unwrap();
+        lm.try_lock(2, res("t"), LockMode::Shared).unwrap();
+        assert_eq!(lm.holds(1, &res("t")), Some(LockMode::Shared));
+        assert_eq!(lm.holds(2, &res("t")), Some(LockMode::Shared));
+    }
+
+    #[test]
+    fn try_lock_sole_holder_upgrades_shared_to_exclusive() {
+        let mut lm = LockManager::new();
+        lm.try_lock(1, res("t"), LockMode::Shared).unwrap();
+        lm.try_lock(1, res("t"), LockMode::Exclusive).unwrap();
+        assert_eq!(lm.holds(1, &res("t")), Some(LockMode::Exclusive));
     }
 }

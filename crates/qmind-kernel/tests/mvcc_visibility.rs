@@ -25,7 +25,7 @@ fn noop(_: &[WalRecord]) -> Result<(), ()> {
 fn rule1_own_writes_visible_to_own_transaction() {
     let mut s = MvccStore::new();
     let (txn, snap) = s.begin();
-    s.set(txn, b"k", vec![1]);
+    s.set(txn, b"k", vec![1]).unwrap();
     assert_eq!(s.read(Some(txn), b"k", &snap), Some(vec![1]));
 }
 
@@ -34,7 +34,7 @@ fn rule2_foreign_uncommitted_writes_invisible() {
     let mut s = MvccStore::new();
     let (ta, _) = s.begin();
     let (tb, snap_b) = s.begin();
-    s.set(ta, b"k", vec![1]);
+    s.set(ta, b"k", vec![1]).unwrap();
     // B's snapshot predates A's commit and A is still open — invisible.
     assert_eq!(s.read(Some(tb), b"k", &snap_b), None);
 }
@@ -43,7 +43,7 @@ fn rule2_foreign_uncommitted_writes_invisible() {
 fn rule3_committed_before_snapshot_is_visible() {
     let mut s = MvccStore::new();
     let (ta, _) = s.begin();
-    s.set(ta, b"k", vec![1]);
+    s.set(ta, b"k", vec![1]).unwrap();
     s.commit(ta, noop).unwrap().unwrap();
 
     let (tb, snap_b) = s.begin();
@@ -54,7 +54,7 @@ fn rule3_committed_before_snapshot_is_visible() {
 fn rule4_post_snapshot_commit_stays_invisible() {
     let mut s = MvccStore::new();
     let (ta, _) = s.begin();
-    s.set(ta, b"k", vec![1]);
+    s.set(ta, b"k", vec![1]).unwrap();
     s.commit(ta, noop).unwrap().unwrap();
 
     // B snapshots the committed world {k=1}.
@@ -63,7 +63,7 @@ fn rule4_post_snapshot_commit_stays_invisible() {
 
     // A2 commits a *later* version of k after B's snapshot.
     let (ta2, _) = s.begin();
-    s.set(ta2, b"k", vec![2]);
+    s.set(ta2, b"k", vec![2]).unwrap();
     s.commit(ta2, noop).unwrap().unwrap();
 
     // B must still observe its own snapshot (k=1), not READ COMMITTED (k=2).
@@ -74,7 +74,7 @@ fn rule4_post_snapshot_commit_stays_invisible() {
 fn rule5_repeated_reads_are_stable_across_commits() {
     let mut s = MvccStore::new();
     let (ta, _) = s.begin();
-    s.set(ta, b"k", vec![1]);
+    s.set(ta, b"k", vec![1]).unwrap();
     s.commit(ta, noop).unwrap().unwrap();
 
     // B's snapshot is taken before any later foreign commit.
@@ -83,7 +83,7 @@ fn rule5_repeated_reads_are_stable_across_commits() {
 
     for i in 2u8..5 {
         let (t, _) = s.begin();
-        s.set(t, b"k", vec![i]);
+        s.set(t, b"k", vec![i]).unwrap();
         s.commit(t, noop).unwrap().unwrap();
     }
 
@@ -99,7 +99,7 @@ fn rule5_repeated_reads_are_stable_across_commits() {
 fn rule7_rolled_back_writes_disappear_for_everyone() {
     let mut s = MvccStore::new();
     let (ta, _) = s.begin();
-    s.set(ta, b"k", vec![1]);
+    s.set(ta, b"k", vec![1]).unwrap();
     s.abort(ta);
 
     // Former writer no longer sees it; a fresh snapshot must see nothing.
@@ -115,11 +115,11 @@ fn rule8_aborted_writes_never_become_visible() {
     // A writes and commits a value, then a second txn overwrites and aborts —
     // the aborted version must never win over the previously committed one.
     let (ta, _) = s.begin();
-    s.set(ta, b"k", vec![1]);
+    s.set(ta, b"k", vec![1]).unwrap();
     s.commit(ta, noop).unwrap().unwrap();
 
     let (tv, snap) = s.begin();
-    s.set(tv, b"k", vec![99]);
+    s.set(tv, b"k", vec![99]).unwrap();
     s.abort(tv);
 
     let (tb, snap_b) = s.begin();
@@ -133,7 +133,7 @@ fn mixed_visibility_within_single_snapshot() {
 
     // Pre-existing committed rows.
     let (p, _) = s.begin();
-    s.set(p, b"a", vec![10]);
+    s.set(p, b"a", vec![10]).unwrap();
     s.commit(p, noop).unwrap().unwrap();
 
     // B's snapshot: sees committed {a}, not the later foreign writes.
@@ -142,16 +142,16 @@ fn mixed_visibility_within_single_snapshot() {
 
     // Foreign committed write after B's snapshot.
     let (f, _) = s.begin();
-    s.set(f, b"x", vec![7]);
+    s.set(f, b"x", vec![7]).unwrap();
     s.commit(f, noop).unwrap().unwrap();
 
     // Foreign rolled-back write after B's snapshot.
     let (r, _) = s.begin();
-    s.set(r, b"y", vec![8]);
+    s.set(r, b"y", vec![8]).unwrap();
     s.abort(r);
 
     // B writes its own row and reads everything back.
-    s.set(b_txn, b"b", vec![20]);
+    s.set(b_txn, b"b", vec![20]).unwrap();
 
     let read = |k: &[u8]| s.read(Some(b_txn), k, &snap_b);
     assert_eq!(read(b"a"), Some(vec![10]), "committed-before-snapshot");
@@ -164,7 +164,7 @@ fn mixed_visibility_within_single_snapshot() {
 fn recovered_committed_rows_stay_visible_later_rows_never_leak() {
     let mut s = MvccStore::new();
     let (a, _) = s.begin();
-    s.set(a, b"k", vec![1]);
+    s.set(a, b"k", vec![1]).unwrap();
     s.commit(a, |recs| {
         let _ = recs;
         Ok::<(), ()>(())
@@ -174,7 +174,7 @@ fn recovered_committed_rows_stay_visible_later_rows_never_leak() {
 
     // In-flight transaction (not yet committed) leaves no WAL footprint.
     let (inflight, _) = s.begin();
-    s.set(inflight, b"junk", vec![9]);
+    s.set(inflight, b"junk", vec![9]).unwrap();
 
     // Reconstruct from the committed records (deferred logging means only the
     // committed txn's Begin/Put/Commit group is on the log).

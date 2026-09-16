@@ -72,24 +72,35 @@ connection is a session and ownership is deterministic:
    snapshots.
 
 The boundary is architectural: writers serialize on the engine's exclusive
-write guard per statement. The kernel's first-committer-wins conflict
-validation still governs *stale* kernel writers, but the SQL session layer
-prevents conflicting writers from even starting, so conflicts cannot surface
-through normal SQL use.
+write guard per statement, and the engine holds at most one explicit
+transaction at a time. Within a session, every row key written is additionally
+protected by a strict-2PL **exclusive row lock** (see :doc:`locking`); at the
+SQL layer the single-writer gate means those locks never collide, so row-lock
+conflicts cannot surface through normal SQL use. The kernel hosts several live
+writers at once, and there both the row locks and the first-committer-wins
+validation do real work — both are proven deterministically at that layer.
 
 Conflict behavior
 -----------------
 
-Two distinct conflict surfaces exist, at different layers:
+Three conflict surfaces exist, at different layers:
 
-* **Kernel (first-committer-wins).** Two live kernel transactions that write
-  the same key: the first to commit wins; the loser gets a deterministic
-  ``Conflict`` and must abort. The loser publishes nothing.
+* **Kernel (strict-2PL row locks).** ``MvccStore::set`` takes an exclusive
+  lock on the row key it writes (non-blocking, deterministic). A second live
+  kernel transaction that targets the same row while it is held gets an
+  immediate ``LockError::Busy`` and buffers nothing; the loser aborts and a
+  fresh transaction retries. Locks are held until commit/abort — see
+  :doc:`locking`.
+* **Kernel (first-committer-wins).** A writer whose snapshot predates a
+  concurrent commit on one of its keys loses at ``COMMIT`` with a
+  deterministic ``Conflict`` and publishes nothing. This still applies once
+  the lock is released: a stale-snapshot write that lands after the holder
+  commits is rejected at commit time.
 * **SQL session (single-writer gate).** A foreign writer is rejected up front,
   before it can affect any engine state.
 
-The kernel conflict path is proven deterministically (``concurrency_semantics``
-kernel tests); the SQL path is proven over real TCP sessions.
+The kernel conflict paths are proven deterministically (``concurrency_semantics``
+and ``lock_2pl`` kernel tests); the SQL path is proven over real TCP sessions.
 
 Writer ownership lifecycle
 --------------------------
@@ -120,7 +131,9 @@ An aborted or failed transaction leaves nothing behind:
 * row-id gaps left by aborted transactions do not misalign index backfill
   (backfill reads real row keys);
 * a WAL-sink failure during ``COMMIT`` surfaces as an error and publishes
-  nothing; the transaction remains abortable and the store stays usable.
+  nothing; the transaction id, its row locks, and its pending writes are all
+  released immediately (no caller cleanup needed), and the store stays usable
+  for the next transaction.
 
 Index visibility under concurrency
 ----------------------------------
@@ -167,15 +180,17 @@ Explicitly unsupported semantics
 
 The current implementation does **not** provide:
 
-* **multi-writer MVCC** at the SQL layer (one writer at a time by design);
-* **lock-free transactions** (writers serialize on the exclusive guard);
+* **multi-writer SQL sessions** (one writer at a time by design; the kernel
+  store — where row locks and write-write conflicts live — already hosts
+  several live writers, proven at the kernel layer);
 * **serializable isolation** (SI is the isolation level; write skew is neither
   prevented nor claimed to be);
 * **READ COMMITTED for explicit transactions** (a pinned SI snapshot never
   advances mid-transaction);
-* **strict 2PL / lock-table concurrency control** — the kernel ships a strict
-  2PL ``LockManager``, but it is *not* wired into the SQL runtime in this phase;
-* **blocking or deadlock-prone wait queues** for conflicting writers — conflict
-  rejection is chosen deliberately over waiting.
+* **blocking write waits** — the SQL/MVCC write path always uses the
+  deterministic no-wait row-lock path (``LockManager::try_lock``). The lock
+  manager's blocking FIFO-queue ``acquire`` with deadlock detection remains an
+  available API capability but is deliberately *not* used by the runtime,
+  which chooses immediate rejection over waiting.
 
 Progress on any of these is a separate R4 phase, not a property of this one.

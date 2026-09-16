@@ -564,10 +564,24 @@ impl<W: Write> Engine<W> {
         // write visibility) and hold them for COMMIT. The row keys are reserved
         // by `next_row_id`, so a later statement in the same transaction never
         // reuses them; a ROLLBACK simply leaves gaps in the id sequence.
+        //
+        // Strict 2PL: every row key is write-locked for the whole transaction.
+        // All keys are reserved up front (statement-atomic at the lock level)
+        // — a conflict fails the statement before any pending write lands, so
+        // a failed statement leaves no partial row state. The subsequent
+        // writes are re-entrant on the reserved locks.
         if let Some(act) = self.active.as_mut() {
             for b in &buffered {
                 self.db
-                    .set(act.txn, &row_key(table, b.rid), b.encoded.clone());
+                    .lock_write(act.txn, &row_key(table, b.rid))
+                    .map_err(|e| {
+                        format!("statement failed: row locked by another transaction ({e:?})")
+                    })?;
+            }
+            for b in &buffered {
+                self.db
+                    .set(act.txn, &row_key(table, b.rid), b.encoded.clone())
+                    .expect("row key is already write-locked by this transaction");
             }
             act.buffered.extend(buffered);
             return Ok(ExecResult {
@@ -577,10 +591,17 @@ impl<W: Write> Engine<W> {
             });
         }
 
-        // Autocommit: one implicit transaction per statement.
+        // Autocommit: one implicit transaction per statement. A lock conflict
+        // aborts the implicit transaction outright — pending writes and locks
+        // are discarded, so the failed statement leaves no trace.
         let (txn, _snap) = self.db.begin();
         for b in &buffered {
-            self.db.set(txn, &row_key(table, b.rid), b.encoded.clone());
+            if let Err(e) = self.db.set(txn, &row_key(table, b.rid), b.encoded.clone()) {
+                self.db.abort(txn);
+                return Err(format!(
+                    "statement failed: row locked by another transaction ({e:?})"
+                ));
+            }
         }
         match self.finish_commit(txn, buffered) {
             Ok(committed) => {

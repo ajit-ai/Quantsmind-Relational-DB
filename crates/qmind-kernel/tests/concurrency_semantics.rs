@@ -1,5 +1,5 @@
-//! R4-CONCURRENCY — deterministic concurrency-semantics proofs at the kernel
-//! level.
+//! R4-CONCURRENCY / R4-LOCK — deterministic concurrency-semantics proofs at
+//! the kernel level.
 //!
 //! `MvccStore` hosts several live transactions in one store, so the concurrency
 //! rules that the single-writer SQL layer can only enforce (not exercise) are
@@ -8,11 +8,15 @@
 //!
 //! 1. Two readers coexist without blocking each other; each holds its own
 //!    immutable snapshot while a third transaction commits.
-//! 2. A losing writer gets a deterministic conflict, leaves no partial state
-//!    behind, aborts cleanly, and a fresh writer can take over.
-//! 3. A WAL-sink failure mid-commit discards everything and the store remains
-//!    fully usable for the next transaction.
+//! 2. A losing writer is rejected deterministically at `set` (strict-2PL no-
+//!    wait Busy) or at commit (first-committer-wins over a stale snapshot),
+//!    leaves no partial state behind, aborts cleanly, and a fresh writer can
+//!    take over.
+//! 3. A WAL-sink failure mid-commit discards everything, releases the txn id
+//!    and its locks, and the store remains fully usable for the next
+//!    transaction.
 
+use qmind_kernel::lock::LockError;
 use qmind_kernel::wal::WalRecord;
 use qmind_kernel::{Conflict, MvccStore};
 
@@ -31,7 +35,7 @@ fn two_concurrent_readers_keep_stable_snapshots_while_writer_commits() {
     let mut s = MvccStore::new();
 
     let (baseline, _) = s.begin();
-    s.set(baseline, b"a", vec![1]);
+    s.set(baseline, b"a", vec![1]).unwrap();
     s.commit(baseline, noop).unwrap().unwrap();
 
     // Both readers snapshot the committed world {a}.
@@ -42,7 +46,7 @@ fn two_concurrent_readers_keep_stable_snapshots_while_writer_commits() {
 
     // Writer commits a new key after both snapshots were taken.
     let (w, _) = s.begin();
-    s.set(w, b"b", vec![2]);
+    s.set(w, b"b", vec![2]).unwrap();
     s.commit(w, noop).unwrap().unwrap();
     assert_eq!(s.commit_watermark(), 2);
 
@@ -63,38 +67,49 @@ fn two_concurrent_readers_keep_stable_snapshots_while_writer_commits() {
     assert_eq!(s.active_txns(), 1);
 }
 
-/// Requirement 3 + 4 + 5: a conflicting writer is rejected deterministically,
-/// releases ownership via abort, and a fresh transaction can write the same key
-/// successfully — the store is never wedged by the loser.
+/// Requirement 3 + 4 + 5: a conflicting writer is rejected deterministically —
+/// either by the strict-2PL no-wait lock at `set` or by first-committer-wins at
+/// commit over a stale snapshot — releases ownership via abort, and a fresh
+/// transaction can write the same key successfully; the store is never wedged
+/// by the loser.
 #[test]
 fn conflicting_writer_aborts_and_a_fresh_txn_retries_cleanly() {
     let mut s = MvccStore::new();
 
+    // All three writers begin against snapshot ts=0.
     let (t1, _) = s.begin();
-    let (t2, _) = s.begin(); // both begin with the same snapshot
-    s.set(t1, b"x", vec![10]);
-    s.set(t2, b"x", vec![20]);
-    s.commit(t1, noop).unwrap().unwrap();
+    let (t2, _) = s.begin();
+    let (t2b, _) = s.begin();
 
-    // Deterministic first-committer-wins conflict on the shared key.
-    let res = s.commit(t2, noop).unwrap();
+    // t2 shares the snapshot but cannot hold the key while t1 owns it:
+    // strict-2PL surfaces the conflict deterministically at `set`.
+    s.set(t1, b"x", vec![10]).unwrap();
+    assert!(matches!(
+        s.set(t2, b"x", vec![20]).unwrap_err(),
+        LockError::Busy
+    ));
+    s.abort(t2);
+    s.commit(t1, noop).unwrap().unwrap();
+    assert_eq!(s.active_txns(), 1); // only t2b (the stale snapshot) remains
+
+    // t2b's snapshot predates t1's commit, so even though the lock was
+    // strictly released at commit, first-committer-wins still rejects it.
+    s.set(t2b, b"x", vec![20]).unwrap();
+    let res = s.commit(t2b, noop).unwrap();
     assert_eq!(res, Err(Conflict { key: b"x".to_vec() }));
 
-    // The loser published nothing and is still responsible for its own state.
+    // The loser published nothing.
     assert_eq!(s.commit_watermark(), 1);
     {
         let snap = s.snapshot();
         assert_eq!(s.get_raw(b"x", &snap), Some(vec![10]));
     }
-    assert_eq!(s.active_txns(), 1);
-
-    // Loser aborts (ownership release) and the store stays usable.
-    s.abort(t2);
+    s.abort(t2b);
     assert_eq!(s.active_txns(), 0);
 
     // A brand-new writer takes over the key and commits normally.
     let (t3, _) = s.begin();
-    s.set(t3, b"x", vec![30]);
+    s.set(t3, b"x", vec![30]).unwrap();
     s.commit(t3, noop).unwrap().unwrap();
 
     let (r, snap) = s.begin();
@@ -108,14 +123,15 @@ fn aborted_after_wal_failure_leaves_no_state_and_store_stays_usable() {
     let mut s = MvccStore::new();
 
     let (t1, _) = s.begin();
-    s.set(t1, b"z", vec![9]);
-    // Sink failure: the commit errors out before publishing.
+    s.set(t1, b"z", vec![9]).unwrap();
+    // Sink failure: the commit errors out before publishing and reaps the
+    // txn (pending id + locks released) immediately.
     let res: Result<Result<(), Conflict>, String> =
         s.commit(t1, |_| Err(String::from("disk full")));
     assert!(res.is_err());
 
-    // The transaction is still the pending owner; abort it cleanly.
-    assert_eq!(s.active_txns(), 1);
+    // The failed commit cleaned up after itself; abort is an idempotent no-op.
+    assert_eq!(s.active_txns(), 0);
     s.abort(t1);
     assert_eq!(s.active_txns(), 0);
 
@@ -125,7 +141,7 @@ fn aborted_after_wal_failure_leaves_no_state_and_store_stays_usable() {
 
     // Next transaction works normally (fresh key, clean WAL sink).
     let (t2, _) = s.begin();
-    s.set(t2, b"z", vec![5]);
+    s.set(t2, b"z", vec![5]).unwrap();
     s.commit(t2, noop).unwrap().unwrap();
 
     let (r2, snap2) = s.begin();
@@ -143,7 +159,7 @@ fn snapshot_scans_stay_stable_across_concurrent_writer_commits() {
     // Committed baseline: a 3-row table.
     for i in 1..=3u8 {
         let (t, _) = s.begin();
-        s.set(t, &[b't', i], vec![i]);
+        s.set(t, &[b't', i], vec![i]).unwrap();
         s.commit(t, noop).unwrap().unwrap();
     }
 
@@ -154,7 +170,7 @@ fn snapshot_scans_stay_stable_across_concurrent_writer_commits() {
     // A concurrent writer commits three more rows after T1's snapshot.
     for i in 4..=6u8 {
         let (t, _) = s.begin();
-        s.set(t, &[b't', i], vec![i]);
+        s.set(t, &[b't', i], vec![i]).unwrap();
         s.commit(t, noop).unwrap().unwrap();
     }
 

@@ -15,3 +15,4 @@ durability and recovery machinery works).
    mvcc
    transactions
    concurrency
+   locking

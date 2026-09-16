@@ -12,6 +12,7 @@
 //! wins), emits WAL records via the caller's sink BEFORE publishing, then
 //! appends versions to the chains.
 
+use crate::lock::{LockError, LockManager, LockMode, Resource};
 use crate::wal::{Lsn, TxnId, WalRecord};
 use std::collections::{BTreeMap, HashMap};
 
@@ -95,12 +96,20 @@ struct Pending {
     writes: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
-/// Snapshot-isolated KV store.
+/// Snapshot-isolated KV store with strict two-phase locking.
+///
+/// Writers additionally hold an exclusive lock on every row key they `set`,
+/// acquired non-blocking (deterministic conflict) and held until
+/// COMMIT/ROLLBACK/abort (strict 2PL). Snapshots and reads take no locks, so
+/// readers stay lock-free against writers. Row keys map 1:1 to lock
+/// resources; a modest UTF-8 row-key assumption lets [`Resource`] key the
+/// lock table.
 #[derive(Debug, Default)]
 pub struct MvccStore {
     data: BTreeMap<Vec<u8>, Vec<Version>>,
     pending: HashMap<TxnId, Pending>,
     mgr: TxnManager,
+    locks: LockManager,
 }
 
 impl MvccStore {
@@ -181,8 +190,17 @@ impl MvccStore {
             .collect()
     }
 
-    /// Buffer a write inside the transaction.
-    pub fn set(&mut self, txn: TxnId, key: &[u8], value: Vec<u8>) {
+    /// Buffer a write inside the transaction, acquiring an exclusive lock on
+    /// the row key first (strict 2PL: the lock is held until commit or abort).
+    ///
+    /// The lock is taken non-blocking. If another live transaction already
+    /// holds the key in an incompatible mode, `Err(LockError::Busy)` is
+    /// returned and nothing is buffered — the writer can abort and retry.
+    /// Re-entrant for a transaction that already holds the key, so a writer
+    /// may update the same row repeatedly.
+    pub fn set(&mut self, txn: TxnId, key: &[u8], value: Vec<u8>) -> Result<(), LockError> {
+        let res = Resource(String::from_utf8_lossy(key).into_owned());
+        self.locks.try_lock(txn, res, LockMode::Exclusive)?;
         self.pending
             .entry(txn)
             .or_insert_with(|| Pending {
@@ -191,6 +209,18 @@ impl MvccStore {
             })
             .writes
             .insert(key.to_vec(), value);
+        Ok(())
+    }
+
+    /// Reserve the exclusive write lock on `key` for `txn` without buffering a
+    /// value. The SQL engine uses this so a multi-row INSERT either locks every
+    /// row up front (statement-atomic at the lock level) or fails with no
+    /// partial pending state. Re-entrant with [`MvccStore::set`] on the same
+    /// key; a reserved-but-unwritten lock is released by commit/abort like
+    /// any other (strict 2PL).
+    pub fn lock_write(&mut self, txn: TxnId, key: &[u8]) -> Result<(), LockError> {
+        let res = Resource(String::from_utf8_lossy(key).into_owned());
+        self.locks.try_lock(txn, res, LockMode::Exclusive)
     }
 
     /// Validate, log via `log_commit`, then publish buffered writes.
@@ -218,6 +248,9 @@ impl MvccStore {
                 .map(|_| key.clone())
         });
         if let Some(key) = conflict {
+            // First-committer-wins: the pending state is re-admitted and the
+            // txn stays live (still holding its locks, strict 2PL) so the
+            // caller can abort or retry.
             self.pending.insert(txn, pending);
             return Ok(Err(Conflict { key }));
         }
@@ -233,7 +266,15 @@ impl MvccStore {
                 });
             }
             recs.push(WalRecord::Commit { txn });
-            log_commit(&recs)?;
+            if let Err(e) = log_commit(&recs) {
+                // WAL sink failed before publication: nothing landed. The
+                // txn is unrecoverable (its pending state was already taken),
+                // so release the transaction id and its locks immediately and
+                // surface the error — no cleanup needed from the caller.
+                self.mgr.finish_abort(txn);
+                self.locks.release_all(txn);
+                return Err(e);
+            }
         }
 
         let commit_ts = self.mgr.finish_commit(txn);
@@ -243,12 +284,17 @@ impl MvccStore {
                 .or_default()
                 .push(Version { commit_ts, value });
         }
+        // Strict 2PL: commit releases every lock the txn held.
+        self.locks.release_all(txn);
         Ok(Ok(()))
     }
 
+    /// Abort a transaction: discard its pending writes and release every lock
+    /// it held (strict 2PL). Idempotent for already-finished transactions.
     pub fn abort(&mut self, txn: TxnId) {
         self.pending.remove(&txn);
         self.mgr.finish_abort(txn);
+        self.locks.release_all(txn);
     }
 
     pub fn active_txns(&self) -> usize {
@@ -313,18 +359,19 @@ impl MvccStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock::LockError;
 
     #[test]
     fn snapshot_isolation_hides_uncommitted_and_future_writes() {
         let mut s = MvccStore::new();
         let (t0, _) = s.begin();
-        s.set(t0, b"k", vec![1]);
+        s.set(t0, b"k", vec![1]).unwrap();
         s.commit::<()>(t0, |_| Ok(())).unwrap().unwrap();
 
         let (reader, rsnap) = s.begin();
 
         let (t1, _) = s.begin();
-        s.set(t1, b"k", vec![2]);
+        s.set(t1, b"k", vec![2]).unwrap();
         assert_eq!(
             s.get(reader, b"k", &rsnap),
             Some(vec![1]),
@@ -345,11 +392,19 @@ mod tests {
     fn first_committer_wins_rejects_stale_writer() {
         let mut s = MvccStore::new();
         let (a, _sa) = s.begin();
+        s.set(a, b"x", vec![10]).unwrap();
+        // Strict 2PL: b cannot hold the key while a owns it — the
+        // deterministic no-wait conflict surfaces at `set`, not commit.
         let (b, _sb) = s.begin();
-        s.set(a, b"x", vec![10]);
-        s.set(b, b"x", vec![20]);
+        assert!(matches!(
+            s.set(b, b"x", vec![20]).unwrap_err(),
+            LockError::Busy
+        ));
         s.commit::<()>(a, |_| Ok(())).unwrap().unwrap();
 
+        // Locks are released at commit, so b may now write — but its snapshot
+        // predates a's commit, so first-committer-wins still rejects at commit.
+        s.set(b, b"x", vec![20]).unwrap();
         let res = s.commit::<()>(b, |_| Ok(())).unwrap();
         assert_eq!(res, Err(Conflict { key: b"x".to_vec() }));
 
@@ -363,8 +418,8 @@ mod tests {
         let mut s = MvccStore::new();
         let (a, _) = s.begin();
         let (b, _) = s.begin();
-        s.set(a, b"k1", vec![1]);
-        s.set(b, b"k2", vec![2]);
+        s.set(a, b"k1", vec![1]).unwrap();
+        s.set(b, b"k2", vec![2]).unwrap();
         s.commit::<()>(a, |_| Ok(())).unwrap().unwrap();
         s.commit::<()>(b, |_| Ok(())).unwrap().unwrap();
         let (c, sc) = s.begin();
@@ -376,7 +431,7 @@ mod tests {
     fn read_your_own_writes_and_abort_discards() {
         let mut s = MvccStore::new();
         let (t, snap) = s.begin();
-        s.set(t, b"mine", vec![42]);
+        s.set(t, b"mine", vec![42]).unwrap();
         assert_eq!(s.get(t, b"mine", &snap), Some(vec![42]));
         s.abort(t);
         let (t2, s2) = s.begin();
@@ -387,11 +442,13 @@ mod tests {
     fn wal_failure_rolls_back_publication() {
         let mut s = MvccStore::new();
         let (t, _) = s.begin();
-        s.set(t, b"z", vec![9]);
+        s.set(t, b"z", vec![9]).unwrap();
         let res: Result<Result<(), Conflict>, String> =
             s.commit(t, |_| Err(String::from("disk full")));
         assert!(res.is_err(), "sink failure must surface");
-        s.abort(t);
+        // The failed commit reaped the txn id and its locks immediately.
+        assert_eq!(s.active_txns(), 0, "sink failure auto-cleans the txn");
+        s.abort(t); // idempotent no-op
         let (v, vs) = s.begin();
         assert_eq!(s.get(v, b"z", &vs), None, "failed WAL publishes nothing");
     }
@@ -400,7 +457,7 @@ mod tests {
     fn aborted_writer_leaves_no_versions() {
         let mut s = MvccStore::new();
         let (t, _) = s.begin();
-        s.set(t, b"gone", vec![5]);
+        s.set(t, b"gone", vec![5]).unwrap();
         s.abort(t);
         let (r, rs) = s.begin();
         assert_eq!(s.get(r, b"gone", &rs), None);
@@ -411,9 +468,9 @@ mod tests {
     fn scan_prefix_yields_latest_committed_values_only() {
         let mut s = MvccStore::new();
         let (t, _) = s.begin();
-        s.set(t, b"t\x01a", vec![1]);
-        s.set(t, b"t\x01b", vec![2]);
-        s.set(t, b"u\x01a", vec![9]); // different table prefix `u`
+        s.set(t, b"t\x01a", vec![1]).unwrap();
+        s.set(t, b"t\x01b", vec![2]).unwrap();
+        s.set(t, b"u\x01a", vec![9]).unwrap(); // different table prefix `u`
         s.commit::<()>(t, |_| Ok(())).unwrap().unwrap();
 
         let snap = s.snapshot();
@@ -423,7 +480,7 @@ mod tests {
 
         // Prefix must not be confused with a longer table name.
         let (t2, _) = s.begin();
-        s.set(t2, b"ta\x01z", vec![3]);
+        s.set(t2, b"ta\x01z", vec![3]).unwrap();
         s.commit::<()>(t2, |_| Ok(())).unwrap().unwrap();
         let snap2 = s.snapshot();
         assert_eq!(s.scan_prefix(b"t\x01", &snap2).len(), 2);
@@ -479,7 +536,7 @@ mod tests {
         // New work must not collide with replayed transaction ids.
         let (t3, s3) = s.begin();
         assert_eq!(t3, 4);
-        s.set(t3, b"d", vec![4]);
+        s.set(t3, b"d", vec![4]).unwrap();
         s.commit::<()>(t3, |_| Ok(())).unwrap().unwrap();
         assert_eq!(s.get(r, b"d", &s3), None, "replay assigns fresh watermark");
         let (r2, s2) = s.begin();
@@ -540,8 +597,8 @@ mod tests {
     fn long_reader_holds_stable_view_across_other_commits() {
         let mut s = MvccStore::new();
         let (setup, _) = s.begin();
-        s.set(setup, b"a", 1i64.to_le_bytes().to_vec());
-        s.set(setup, b"b", 1i64.to_le_bytes().to_vec());
+        s.set(setup, b"a", 1i64.to_le_bytes().to_vec()).unwrap();
+        s.set(setup, b"b", 1i64.to_le_bytes().to_vec()).unwrap();
         s.commit::<()>(setup, |_| Ok(())).unwrap().unwrap();
 
         let (reader, rsnap) = s.begin();
@@ -550,7 +607,7 @@ mod tests {
         for i in 2..10u64 {
             let (w, _) = s.begin();
             let key = if i % 2 == 0 { b"a" as &[u8] } else { b"b" };
-            s.set(w, key, i.to_le_bytes().to_vec());
+            s.set(w, key, i.to_le_bytes().to_vec()).unwrap();
             s.commit::<()>(w, |_| Ok(())).unwrap().unwrap();
         }
         assert_eq!(
@@ -562,7 +619,7 @@ mod tests {
             Some(1i64.to_le_bytes().to_vec())
         );
 
-        s.set(stale, b"a", vec![99, 9]);
+        s.set(stale, b"a", vec![99, 9]).unwrap();
         let res = s.commit::<()>(stale, |_| Ok(())).unwrap();
         assert!(
             res.is_err(),

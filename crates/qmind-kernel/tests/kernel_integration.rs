@@ -112,7 +112,8 @@ fn mvcc_commit_rides_wal_and_recovery_rebuilds_state() {
                 t,
                 format!("key{i}").as_bytes(),
                 (i * 1000).to_le_bytes().to_vec(),
-            );
+            )
+            .unwrap();
             let logged = db
                 .commit::<()>(t, |recs| {
                     for r in recs {
@@ -125,7 +126,7 @@ fn mvcc_commit_rides_wal_and_recovery_rebuilds_state() {
         }
         // Crash with an uncommitted group buffered.
         let (t, _) = db.begin();
-        db.set(t, b"lost", vec![9, 9, 9]);
+        db.set(t, b"lost", vec![9, 9, 9]).unwrap();
         drop(wal); // "lost" never reached the sink
         db.abort(t);
     }
@@ -150,7 +151,7 @@ fn mvcc_commit_rides_wal_and_recovery_rebuilds_state() {
                 if let Some(rows) = open.remove(txn) {
                     let (t, _) = recovered.begin();
                     for (k, v) in rows {
-                        recovered.set(t, &k, v);
+                        recovered.set(t, &k, v).unwrap();
                     }
                     recovered.commit::<()>(t, |_| Ok(())).unwrap().unwrap();
                 }

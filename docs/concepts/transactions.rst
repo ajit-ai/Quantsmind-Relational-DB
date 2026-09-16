@@ -150,6 +150,11 @@ Errors and recovery
 
 * Commit failures (WAL errors) abort the transaction before any row is
   published.
+* Every row a transaction writes is exclusively locked from the first write
+  until commit/abort (strict 2PL, see :doc:`locking`). At the SQL layer the
+  single-writer gate means these locks never collide; at the kernel layer a
+  live lock conflict rejects the requester immediately, and the losing
+  transaction rolls back cleanly.
 * Write-write conflicts fail with ``first-committer-wins`` semantics
   (``transaction aborted: write-write conflict ...``) and the losing
   transaction is rolled back cleanly.

@@ -554,3 +554,65 @@ fn failed_statement_inside_txn_leaves_no_partial_state() {
     let r = eng.execute("SELECT v FROM t WHERE id = 2").unwrap();
     assert_eq!(r.rows[0], vec![SqlValue::Text("fresh".into())]);
 }
+
+#[test]
+fn multi_row_insert_reserves_all_rows_and_commits_with_indexes() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE t (id INTEGER, v TEXT)").unwrap();
+    eng.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+
+    // Explicit txn: INSERT reserves every row key up front (statement-atomic
+    // at the lock level), writes them re-entrantly, then COMMIT materializes
+    // all rows plus the secondary index in one durable step.
+    eng.execute("BEGIN").unwrap();
+    eng.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    let r = eng.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(
+        cols(&r)[0],
+        SqlValue::Int(3),
+        "own multi-row writes visible"
+    );
+    eng.execute("COMMIT").unwrap();
+
+    let r = eng.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(cols(&r)[0], SqlValue::Int(3));
+    let r = eng.execute("SELECT id FROM t WHERE v = 'b'").unwrap();
+    assert_eq!(r.rows[0], vec![SqlValue::Int(2)], "index reflects all rows");
+
+    // A second multi-row batch in a fresh autocommit statement works too.
+    let r = eng
+        .execute("INSERT INTO t VALUES (4, 'd'), (5, 'e')")
+        .unwrap();
+    assert_eq!(r.rows_affected, 2);
+    let r = eng.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(cols(&r)[0], SqlValue::Int(5));
+    let r = eng.execute("SELECT id FROM t WHERE v = 'e'").unwrap();
+    assert_eq!(r.rows[0], vec![SqlValue::Int(5)]);
+}
+
+#[test]
+fn multi_row_insert_statement_failure_leaves_no_partial_rows() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE t (id INTEGER NOT NULL, v TEXT)")
+        .unwrap();
+
+    eng.execute("BEGIN").unwrap();
+    // The middle row violates NOT NULL: validation fails before any row key is
+    // reserved or written, so the statement is all-or-nothing.
+    let err = eng
+        .execute("INSERT INTO t VALUES (1, 'a'), (NULL, 'x'), (3, 'c')")
+        .unwrap_err();
+    assert!(err.contains("NOT NULL"), "unexpected error: {err}");
+    assert!(eng.in_transaction(), "statement failure keeps the txn open");
+
+    // No partial state: neither reserve nor write leaked a row.
+    let r = eng.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(cols(&r)[0], SqlValue::Int(0));
+
+    // The transaction remains fully usable.
+    eng.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+    eng.execute("COMMIT").unwrap();
+    let r = eng.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(cols(&r)[0], SqlValue::Int(1));
+}
