@@ -158,6 +158,16 @@ writes an ``Abort`` record for audit). After ``open_db``:
 
 Recovered MVCC state therefore preserves the same visibility contract.
 
+Concurrency
+-----------
+
+The kernel hosts several live transactions in one store; the SQL layer adds a
+single-writer session boundary on top of that store. Readers hold stable
+snapshots while other transactions commit, and writer conflicts are resolved
+deterministically at both layers. See :doc:`concurrency` for the full model:
+ownership lifecycle, conflict surfaces, failure cleanup, and the explicitly
+unsupported semantics.
+
 Current limitation
 ------------------
 

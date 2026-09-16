@@ -1,7 +1,8 @@
 //! M5: full wire-protocol roundtrip over real TCP sockets.
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, RwLock};
+use std::sync::{mpsc, Arc, RwLock};
+use std::time::Duration;
 
 fn start_server() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -318,4 +319,187 @@ fn rolled_back_owner_rows_invisible_to_foreign_session() {
     );
     let rows = query(&mut c1, "SELECT COUNT(*) FROM rb;");
     assert_eq!(rows, vec![vec!["0".to_string()]]);
+}
+
+#[test]
+fn disconnected_owner_releases_writer_ownership() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE owned (id INTEGER);");
+
+    // The owning session begins, writes, and drops the socket without an
+    // explicit COMMIT or ROLLBACK.
+    query(&mut c1, "BEGIN;");
+    query(&mut c1, "INSERT INTO owned VALUES (1);");
+    drop(c1);
+
+    // The server must roll the abandoned transaction back asynchronously.
+    let mut c2 = connect(port);
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM owned;");
+    assert_eq!(rows, vec![vec!["0".to_string()]]);
+
+    // Writer ownership is released, so a later writer can take over. The
+    // rollback happens on the server's connection thread, so retry the write
+    // until the ownership releases (bounded retries, no sleeps).
+    let mut inserted = false;
+    for _ in 0..200 {
+        match query_result(&mut c2, "INSERT INTO owned VALUES (2);") {
+            Ok(_) => {
+                inserted = true;
+                break;
+            }
+            Err(e) => assert!(
+                e.contains("single-writer constraint"),
+                "unexpected rejection: {e}"
+            ),
+        }
+    }
+    assert!(inserted, "writer ownership never released after disconnect");
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM owned;");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "only the post-rollback write committed"
+    );
+}
+
+#[test]
+fn failed_statement_holds_ownership_until_rollback_then_releases() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE fail_t (id INTEGER, v TEXT);");
+
+    // Owner: BEGIN, one successful insert, then a failing statement.
+    query(&mut c1, "BEGIN;");
+    query(&mut c1, "INSERT INTO fail_t VALUES (1, 'ok');");
+    let err = query_result(&mut c1, "INSERT INTO fail_t VALUES (2);").unwrap_err();
+    assert!(err.contains("has 2 columns"), "unexpected error: {err}");
+
+    // Statement failure does not end the transaction: ownership is still held,
+    // so a foreign writer stays rejected under the single-writer constraint.
+    let mut c2 = connect(port);
+    let err = query_result(&mut c2, "INSERT INTO fail_t VALUES (3, 'foreign');").unwrap_err();
+    assert!(err.contains("single-writer constraint"), "{err}");
+
+    // Ownership is released by ROLLBACK; the foreign writer can now proceed,
+    // and the owner's earlier write is gone (no partial state persisted).
+    query(&mut c1, "ROLLBACK;");
+    query(&mut c2, "INSERT INTO fail_t VALUES (3, 'foreign');");
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM fail_t;");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "rolled-back owner row must not survive"
+    );
+}
+
+#[test]
+fn ownership_flows_between_sessions_only_via_terminal_statement() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE flow (id INTEGER);");
+
+    // Session 1 acquires writer ownership.
+    query(&mut c1, "BEGIN;");
+    query(&mut c1, "INSERT INTO flow VALUES (1);");
+
+    // Session 2's concurrent BEGIN is deterministically rejected: the engine's
+    // single explicit transaction is already owned.
+    let mut c2 = connect(port);
+    let err = query_result(&mut c2, "BEGIN;").unwrap_err();
+    assert!(
+        err.contains("write connection"),
+        "foreign BEGIN must be rejected, got: {err}"
+    );
+    // ...and its writes are blocked too.
+    let err = query_result(&mut c2, "INSERT INTO flow VALUES (2);").unwrap_err();
+    assert!(err.contains("single-writer constraint"), "{err}");
+
+    // Owner COMMIT transfers ownership; session 2 takes over and commits.
+    query(&mut c1, "COMMIT;");
+    query(&mut c2, "BEGIN;");
+    query(&mut c2, "INSERT INTO flow VALUES (2);");
+    query(&mut c2, "COMMIT;");
+
+    // Both sessions' committed rows are present; neither transaction wedged.
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM flow;");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM flow;");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+#[test]
+fn handshaken_reader_never_observes_open_explicit_transaction() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE hand (id INTEGER, v TEXT);");
+    query(&mut c1, "CREATE INDEX ih ON hand (id);");
+    // A second table whose committed rows a JOIN can match against.
+    query(&mut c1, "CREATE TABLE grp (gid INTEGER);");
+    for i in 1..=101i64 {
+        query(&mut c1, &format!("INSERT INTO grp VALUES ({i});"));
+    }
+    query(&mut c1, "INSERT INTO hand VALUES (1, 'base');");
+
+    // Deterministic handshake: the writer session owns a live explicit
+    // transaction (buffered, uncommitted) while the reader session probes it.
+    let (begin_tx, begin_rx) = mpsc::channel::<()>();
+    let (gate_tx, gate_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+
+    let owner = std::thread::spawn(move || {
+        let mut co = connect(port);
+        query(&mut co, "BEGIN;");
+        let values: Vec<String> = (2..=101i64).map(|i| format!("({i}, 'tx{i}')")).collect();
+        query(
+            &mut co,
+            &format!("INSERT INTO hand VALUES {};", values.join(",")),
+        );
+        begin_tx.send(()).unwrap();
+        gate_rx.recv().unwrap();
+        query(&mut co, "COMMIT;");
+        done_tx.send(()).unwrap();
+    });
+
+    // Until the owner commits, the foreign reader must see committed state
+    // only — across the scan, an indexed lookup, GROUP BY and a JOIN.
+    begin_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM hand;");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "scan must stay committed-only mid-transaction"
+    );
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM hand WHERE id = 7;");
+    assert_eq!(
+        rows,
+        vec![vec!["0".to_string()]],
+        "index lookup must not leak a buffered row"
+    );
+    let rows = query(&mut c1, "SELECT v, COUNT(*) FROM hand GROUP BY v;");
+    assert_eq!(
+        rows,
+        vec![vec!["base".to_string(), "1".to_string()]],
+        "GROUP BY must not include buffered groups"
+    );
+    let rows = query(&mut c1, "SELECT id FROM hand JOIN grp ON id = gid;");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "JOIN must not expose buffered rows"
+    );
+
+    // Release the writer; after COMMIT the same reader sees everything.
+    gate_tx.send(()).unwrap();
+    done_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    owner.join().unwrap();
+
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM hand;");
+    assert_eq!(rows, vec![vec!["101".to_string()]]);
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM hand WHERE id = 7;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM hand GROUP BY v;");
+    assert_eq!(rows.len(), 101, "committed groups become visible");
+    let rows = query(&mut c1, "SELECT id FROM hand JOIN grp ON id = gid;");
+    assert_eq!(rows.len(), 101, "committed JOIN rows become visible");
 }

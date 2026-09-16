@@ -18,6 +18,7 @@ architecture decision records behind the R3 choices.
    :caption: R4 milestones
 
    R4_MVCC_COMPLETION_REPORT
+   R4_CONCURRENCY_COMPLETION_REPORT
 
 Architecture decision records (ADRs)
 ------------------------------------

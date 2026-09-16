@@ -66,10 +66,7 @@ fn handle_conn<W: Write>(mut s: TcpStream, eng: Arc<RwLock<Engine<W>>>) -> std::
     ready(&mut s)?;
 
     let mut session_txn = false;
-    loop {
-        let Some((tag, payload)) = read_packet(&mut s)? else {
-            return Ok(());
-        };
+    while let Some((tag, payload)) = read_packet(&mut s)? {
         match tag {
             b'Q' => {
                 let sql = String::from_utf8_lossy(&payload)
@@ -79,12 +76,34 @@ fn handle_conn<W: Write>(mut s: TcpStream, eng: Arc<RwLock<Engine<W>>>) -> std::
                 // single explicit transaction across packets.
                 run_query(&mut s, &eng, &sql, &mut session_txn)?;
             }
-            b'X' => return Ok(()),
+            b'X' => break,
             _ => {
                 error(&mut s, "unsupported message")?;
                 ready(&mut s)?;
             }
         }
+    }
+    // R4-CONCURRENCY: a session that owns the engine's single explicit
+    // transaction and then disconnects (Terminate packet or TCP close) must
+    // release its writer ownership. Without this the engine's transaction slot
+    // stays permanently active and every later writer would be rejected under
+    // the single-writer constraint. ROLLBACK is a pure in-memory discard here:
+    // nothing was materialized mid-transaction.
+    release_session_txn(&eng, session_txn);
+    Ok(())
+}
+
+/// R4-CONCURRENCY: if `session_txn` owns the engine's single explicit
+/// transaction, abort it so writer ownership is released when the connection
+/// ends without an explicit COMMIT or ROLLBACK. Safe to call at most once per
+/// connection; the engine may already have reaped the transaction (a failed
+/// COMMIT), in which case this is a no-op.
+fn release_session_txn<W: Write>(eng: &Arc<RwLock<Engine<W>>>, session_txn: bool) {
+    if !session_txn {
+        return;
+    }
+    if let Ok(mut guard) = eng.write() {
+        let _ = guard.execute("ROLLBACK");
     }
 }
 
@@ -209,6 +228,15 @@ fn run_query<W: Write>(
                 )?;
             }
             Err(e) => {
+                // R4-CONCURRENCY: a failed COMMIT or ROLLBACK ends this
+                // session's writer ownership — `txn_commit`/`txn_rollback`
+                // have already taken (and either finished or discarded) the
+                // engine's active transaction. Resetting the flag keeps the
+                // session's ownership model in sync with the engine state; the
+                // transaction is not left half-open.
+                if matches!(kw.as_deref(), Some("COMMIT") | Some("ROLLBACK")) {
+                    *session_txn = false;
+                }
                 error(s, &e)?;
                 break;
             }

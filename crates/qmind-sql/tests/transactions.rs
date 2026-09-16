@@ -479,3 +479,78 @@ fn read_only_transaction_has_stable_repeated_views() {
     let r = eng.execute("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(cols(&r)[0], SqlValue::Int(5));
 }
+
+#[test]
+fn ownership_released_after_commit_rollback_and_failure() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE t (id INTEGER)").unwrap();
+    assert!(!eng.in_transaction(), "no transaction before BEGIN");
+
+    // COMMIT releases writer ownership.
+    eng.execute("BEGIN").unwrap();
+    assert!(eng.in_transaction());
+    eng.execute("INSERT INTO t VALUES (1)").unwrap();
+    eng.execute("COMMIT").unwrap();
+    assert!(!eng.in_transaction());
+
+    // ROLLBACK releases writer ownership.
+    eng.execute("BEGIN").unwrap();
+    assert!(eng.in_transaction());
+    eng.execute("INSERT INTO t VALUES (2)").unwrap();
+    eng.execute("ROLLBACK").unwrap();
+    assert!(!eng.in_transaction());
+
+    // A failed statement does not silently end the transaction (the documented
+    // SQL semantic), but ROLLBACK still releases ownership afterwards.
+    eng.execute("BEGIN").unwrap();
+    eng.execute("INSERT INTO t VALUES (3)").unwrap();
+    let err = eng.execute("INSERT INTO missing VALUES (1)").unwrap_err();
+    assert!(!err.is_empty());
+    assert!(eng.in_transaction(), "statement failure keeps the txn open");
+    eng.execute("ROLLBACK").unwrap();
+    assert!(!eng.in_transaction());
+
+    // Only the first row ever committed.
+    let r = eng.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(cols(&r)[0], SqlValue::Int(1));
+
+    // The engine is fully usable afterwards: ownership is never permanently stuck.
+    eng.execute("BEGIN").unwrap();
+    assert!(eng.in_transaction());
+    eng.execute("INSERT INTO t VALUES (4)").unwrap();
+    eng.execute("COMMIT").unwrap();
+    assert!(!eng.in_transaction());
+    let r = eng.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(cols(&r)[0], SqlValue::Int(2));
+}
+
+#[test]
+fn failed_statement_inside_txn_leaves_no_partial_state() {
+    let mut eng = Engine::new(Vec::new());
+    eng.execute("CREATE TABLE t (id INTEGER, v TEXT)").unwrap();
+
+    eng.execute("BEGIN").unwrap();
+    eng.execute("INSERT INTO t VALUES (1, 'kept')").unwrap();
+
+    // Wrong arity: the statement fails without buffering anything.
+    let err = eng.execute("INSERT INTO t VALUES (2)").unwrap_err();
+    assert!(err.contains("has 2 columns"), "unexpected error: {err}");
+    assert!(eng.in_transaction(), "statement failure keeps the txn open");
+
+    // The successful earlier statement is still visible inside the txn.
+    let r = eng.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(cols(&r)[0], SqlValue::Int(1));
+
+    // ROLLBACK discards everything, including the earlier successful write.
+    eng.execute("ROLLBACK").unwrap();
+    assert!(!eng.in_transaction());
+    let r = eng.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(cols(&r)[0], SqlValue::Int(0));
+
+    // A subsequent write lands and the engine is healthy.
+    eng.execute("INSERT INTO t VALUES (2, 'fresh')").unwrap();
+    let r = eng.execute("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(cols(&r)[0], SqlValue::Int(1));
+    let r = eng.execute("SELECT v FROM t WHERE id = 2").unwrap();
+    assert_eq!(r.rows[0], vec![SqlValue::Text("fresh".into())]);
+}

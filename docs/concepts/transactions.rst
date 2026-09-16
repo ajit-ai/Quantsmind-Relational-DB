@@ -101,12 +101,31 @@ layer, each connection is a session:
 * a **foreign session** (one that does not own the transaction) may still read:
   its SELECTs run on committed-only snapshots and never observe the owner's
   uncommitted state;
-* foreign **writes are rejected** while a transaction is open
-  (``single-writer constraint``).
+* foreign **writes are rejected while a transaction is open** with a
+  deterministic ``single-writer constraint`` error, delivered before any
+  execution, so the rejected session never touches engine state and can simply
+  retry once the owner finishes;
+* a rejected writer's transaction state remains valid: it may read immediately,
+  and take over the writer slot after the owner commits, rolls back, or
+  disconnects.
 
-Concurrent foreign writes remain restricted by this constraint and are
-addressed in later R4 concurrency work. Readers are not blocked: the read
-snapshot path runs lock-free on committed data.
+Writer ownership is released — deterministically — by:
+
+* ``COMMIT``,
+* ``ROLLBACK``,
+* a failed ``COMMIT`` / ``ROLLBACK`` (the engine has already taken or discarded
+  the active transaction),
+* **session termination**: a connection that closes while owning an open
+  transaction (Terminate packet or TCP disconnect) has it rolled back
+  automatically, so a later session can always acquire the writer slot.
+
+A failed *statement* inside a transaction does **not** release ownership: the
+transaction continues and the owner keeps it until ``COMMIT`` / ``ROLLBACK``.
+Ownership never becomes permanently stuck.
+
+Readers are not blocked: the read snapshot path runs lock-free on committed
+data. See :doc:`concurrency` for the full concurrency model, the conflict
+surfaces, and the explicitly unsupported semantics.
 
 Columnar (HTAP) interplay
 -------------------------
