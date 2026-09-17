@@ -5,6 +5,7 @@
 use qmind_sql::{Engine, SqlValue};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 const PROTOCOL_V3: i32 = 196608;
@@ -14,11 +15,17 @@ pub fn serve<W: Write + Send + Sync + 'static>(
     listener: TcpListener,
     engine: Arc<RwLock<Engine<W>>>,
 ) {
+    let next_session = Arc::new(AtomicU64::new(1));
     for stream in listener.incoming() {
         let Ok(s) = stream else { continue };
         let e = Arc::clone(&engine);
+        let ns = Arc::clone(&next_session);
         std::thread::spawn(move || {
-            let _ = handle_conn(s, e);
+            // R4-MULTIWRITER: every connection is a distinct session that may
+            // own its own explicit transaction across packets, concurrently
+            // with every other connection.
+            let sid = ns.fetch_add(1, Ordering::SeqCst);
+            let _ = handle_conn(s, e, sid);
         });
     }
 }
@@ -39,7 +46,11 @@ fn read_packet(stream: &mut TcpStream) -> std::io::Result<Option<(u8, Vec<u8>)>>
     Ok(Some((t[0], p)))
 }
 
-fn handle_conn<W: Write>(mut s: TcpStream, eng: Arc<RwLock<Engine<W>>>) -> std::io::Result<()> {
+fn handle_conn<W: Write>(
+    mut s: TcpStream,
+    eng: Arc<RwLock<Engine<W>>>,
+    session: u64,
+) -> std::io::Result<()> {
     let mut lb = [0u8; 4];
     if s.read_exact(&mut lb).is_err() {
         return Ok(());
@@ -55,7 +66,7 @@ fn handle_conn<W: Write>(mut s: TcpStream, eng: Arc<RwLock<Engine<W>>>) -> std::
         // SSLRequest
         s.write_all(b"N")?;
         s.flush()?;
-        return handle_conn(s, eng);
+        return handle_conn(s, eng, session);
     }
     if proto != PROTOCOL_V3 {
         return Ok(());
@@ -65,30 +76,54 @@ fn handle_conn<W: Write>(mut s: TcpStream, eng: Arc<RwLock<Engine<W>>>) -> std::
     param(&mut s, "client_encoding", "UTF8")?;
     ready(&mut s)?;
 
-    loop {
-        let Some((tag, payload)) = read_packet(&mut s)? else {
-            return Ok(());
-        };
+    let mut session_has_txn = false;
+    while let Some((tag, payload)) = read_packet(&mut s)? {
         match tag {
             b'Q' => {
                 let sql = String::from_utf8_lossy(&payload)
                     .trim_end_matches('\0')
                     .to_string();
-                run_query(&mut s, &eng, &sql)?;
+                run_query(&mut s, &eng, session, &sql, &mut session_has_txn)?;
             }
-            b'X' => return Ok(()),
+            b'X' => break,
             _ => {
                 error(&mut s, "unsupported message")?;
                 ready(&mut s)?;
             }
         }
     }
+    // R4-MULTIWRITER: a session that owns an explicit transaction and then
+    // disconnects (Terminate packet or TCP close) must have that transaction
+    // rolled back so its row locks are released and other sessions are never
+    // blocked. The rollback is per session; every other session's transaction
+    // is unaffected. ROLLBACK is a pure in-memory discard here: nothing was
+    // materialized mid-transaction.
+    release_session_txn(&eng, session);
+    Ok(())
+}
+
+/// R4-MULTIWRITER: if `session` holds an explicit transaction, abort it so the
+/// transaction's locks and pending writes are released when the connection
+/// ends without an explicit COMMIT or ROLLBACK. Safe to call at most once per
+/// connection; when the engine holds no transaction for the session this is a
+/// no-op (`txn_rollback` errors before emitting any side effect).
+fn release_session_txn<W: Write>(eng: &Arc<RwLock<Engine<W>>>, session: u64) {
+    if let Ok(guard) = eng.read() {
+        if !guard.session_in_transaction(session) {
+            return;
+        }
+    }
+    if let Ok(mut guard) = eng.write() {
+        let _ = guard.execute_session(session, "ROLLBACK");
+    }
 }
 
 fn run_query<W: Write>(
     s: &mut TcpStream,
     eng: &Arc<RwLock<Engine<W>>>,
+    session: u64,
     sql: &str,
+    session_has_txn: &mut bool,
 ) -> std::io::Result<()> {
     // Multiple statements separated by ';' execute sequentially.
     let stmts: Vec<&str> = sql
@@ -101,10 +136,27 @@ fn run_query<W: Write>(
         return ready(s);
     }
     for st in stmts {
-        // P5: route by leading keyword — reads run on a shared guard via
-        // `execute_read` (snapshot), writes take the exclusive guard.
         let kw = st.split_whitespace().next().map(|w| w.to_ascii_uppercase());
-        let res = if matches!(kw.as_deref(), Some("SELECT") | Some("SHOW")) {
+        // R4-MULTIWRITER routing: while this session owns its own explicit
+        // transaction, every statement (including SELECT) runs on the write
+        // path so the transaction's own uncommitted writes stay visible and
+        // join the same transaction. Sessions outside a transaction read on a
+        // committed-only snapshot and write in autocommit. Multiple sessions
+        // may hold explicit transactions concurrently; row-key write conflicts
+        // surface deterministically as statement errors (no blocking).
+        let owned = {
+            let guard = match eng.read() {
+                Ok(g) => g,
+                Err(_) => {
+                    error(s, "engine poisoned")?;
+                    return ready(s);
+                }
+            };
+            *session_has_txn || guard.session_in_transaction(session)
+        };
+        let res = if !owned && matches!(kw.as_deref(), Some("SELECT") | Some("SHOW")) {
+            // Fast path: read on a committed-only snapshot under the shared
+            // guard; never polluted by any session's uncommitted writes.
             let guard = match eng.read() {
                 Ok(g) => g,
                 Err(_) => {
@@ -114,6 +166,9 @@ fn run_query<W: Write>(
             };
             guard.execute_read(st)
         } else {
+            // Write path: session-owned transaction (own-write visibility) or
+            // autocommit DML/DDL. The engine write guard serializes statement
+            // execution while leaving transactions per-session independent.
             let mut guard = match eng.write() {
                 Ok(g) => g,
                 Err(_) => {
@@ -121,10 +176,15 @@ fn run_query<W: Write>(
                     return ready(s);
                 }
             };
-            guard.execute(st)
+            guard.execute_session(session, st)
         };
         match res {
             Ok(res) => {
+                match kw.as_deref() {
+                    Some("BEGIN") => *session_has_txn = true,
+                    Some("COMMIT") | Some("ROLLBACK") => *session_has_txn = false,
+                    _ => {}
+                }
                 if !res.columns.is_empty() {
                     row_description(s, &res.columns)?;
                     for row in &res.rows {
@@ -153,6 +213,14 @@ fn run_query<W: Write>(
                 )?;
             }
             Err(e) => {
+                // A failed COMMIT or ROLLBACK still ends this session's
+                // transaction — `txn_commit`/`txn_rollback` have already taken
+                // (and either finished or discarded) it. Resetting the flag
+                // keeps the session's tracking in sync with the engine state;
+                // no transaction is left half-open.
+                if matches!(kw.as_deref(), Some("COMMIT") | Some("ROLLBACK")) {
+                    *session_has_txn = false;
+                }
                 error(s, &e)?;
                 break;
             }

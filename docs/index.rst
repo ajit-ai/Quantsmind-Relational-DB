@@ -28,6 +28,10 @@ GUI studio.
    architecture
    roadmap
    quickstart
+   concepts/index
+   developer-guide/index
+   architecture/index
+   benchmarks/index
 
 Design pillars
 ==============
@@ -85,11 +89,14 @@ Feature surface (as of 0.1.0)
 * Runtime: zero runtime dependencies in the kernel; embeddable library.
 * Durability (R2): fsync-disciplined WAL with full-log replay, durable catalog,
   index rebuild on open, torn-tail truncation, format versioning, subprocess
-  crash-recovery tests (170 tests, up from 143 at R1).
+  crash-recovery tests.
+* Execution (R3): persistent storage manager over the page store, batch
+  execution with streaming results, and a persistent-storage query path.
+  :doc:`See the R3 documentation <architecture/index>`.
 
 Test suite
 ==========
 
-170 tests green across 5 crates (85 kernel + 81 SQL + 2 embed + 2 wire),
-with ``cargo fmt --check`` and ``cargo clippy -D warnings`` enforced on CI
-(Ubuntu + Windows). See :ref:`testing` for the full breakdown.
+208 tests green across the workspace, with ``cargo fmt --check`` and
+``cargo clippy -D warnings`` enforced on CI (Ubuntu + Windows). See
+:ref:`testing` for the full breakdown.

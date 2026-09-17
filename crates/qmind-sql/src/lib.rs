@@ -5,11 +5,14 @@
 //! - M3: single-table DDL/DML + scan/filter/project, columnar batches (~2048 rows)
 //! - M4: joins, aggregates, secondary indexes, OLTP/OLAP plan routing (D-001)
 
+pub mod batch;
+pub mod batch_ops;
 pub mod codec;
 pub mod dbdir;
 pub mod engine;
 pub mod executor;
 pub mod parser;
+pub mod result_stream;
 
 pub use codec::{ColumnDef, ColumnType, SqlValue};
 pub use engine::{Engine, ExecResult};

@@ -17,8 +17,9 @@ use crate::parser::{self, BinOp, DataType, Expr, SelectItem, Statement, TableRef
 use qmind_kernel::column_delta::{ColumnDataType, ColumnInfo, DeltaApplier, TableSchema};
 use qmind_kernel::column_reader::ColumnarReader;
 use qmind_kernel::columnar::ColValue;
-use qmind_kernel::wal::{CatalogColumn, ColumnKind};
+use qmind_kernel::wal::{CatalogColumn, ColumnKind, TxnId};
 use qmind_kernel::{BTree, Error as KError, MvccStore, Snapshot, WalRecord, WalWriter};
+use qmind_kernel::{BufferPool, FilePageStore, StorageManager};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -57,6 +58,50 @@ pub struct Engine<W: Write> {
     delta_applier: Option<DeltaApplier>,
     /// Row count threshold before auto-flushing to columnar segments.
     columnar_flush_threshold: usize,
+    /// R3: optional persistent table storage (file-backed engines only).
+    /// Populated by `create_db` / `open_db`; `None` for in-memory `Engine`.
+    storage: Option<StorageManager<FilePageStore>>,
+    /// R4-MULTIWRITER: the explicit transactions currently open on this
+    /// engine, keyed by session. Multiple sessions may hold concurrent explicit
+    /// transactions: each carries its own kernel txn id, snapshot, row locks
+    /// (strict 2PL) and buffered rows. Statement execution is still serialized
+    /// by `&mut self` (and the server's engine write guard), but transactions
+    /// themselves live independently — any subset may roll back or commit
+    /// (first-committer-wins on actual key overlap, which the append-only
+    /// row-id allocation keeps disjoint). Session 0 is the embedded/default
+    /// session used by [`execute`](Self::execute). Concurrent readers stay
+    /// lock-free via `execute_read` snapshots.
+    active: HashMap<SessionId, ActiveTxn>,
+}
+
+/// Identity of a database session. The embedded API ([`Engine::execute`]) uses
+/// session 0; the wire server assigns each connection a unique id so every
+/// connection can hold its own explicit transaction concurrently.
+pub type SessionId = u64;
+
+/// One buffered insert row inside an explicit transaction. Secondary index
+/// entries, columnar deltas, and persistent page rows are all materialized
+/// only at COMMIT so a ROLLBACK never leaks phantom index/columnar state.
+#[derive(Debug)]
+struct BufferedRow {
+    table: String,
+    rid: u64,
+    encoded: Vec<u8>,
+    values: Vec<SqlValue>,
+}
+
+/// R4 — explicit transaction state on the engine (thin lifecycle shim over the
+/// kernel's `MvccStore` pending-transaction representation; deliberately not a
+/// duplicate transaction state machine).
+#[derive(Debug)]
+struct ActiveTxn {
+    /// Kernel txn id, derives WAL identity and MVCC version ordering.
+    txn: TxnId,
+    /// Read horizon captured at BEGIN; all reads in the txn observe it.
+    snap: Snapshot,
+    /// Rows inserted since BEGIN, materialized to indexes/columnar/pages at
+    /// COMMIT (write-ahead: WAL is synced before any of this).
+    buffered: Vec<BufferedRow>,
 }
 
 /// Secondary index definition. Indexes are single-column, non-NULL.
@@ -83,6 +128,8 @@ impl<W: Write> Engine<W> {
             columnar_dir: None,
             delta_applier: None,
             columnar_flush_threshold: 10_000,
+            storage: None,
+            active: HashMap::new(),
         }
     }
 
@@ -155,8 +202,26 @@ impl<W: Write> Engine<W> {
             .collect())
     }
 
-    /// Parse + execute a single statement.
+    /// Parse + execute a single statement on the embedded default session
+    /// (session 0). See [`execute_session`](Self::execute_session) for the
+    /// session-aware form used by the wire server.
+    ///
+    /// R4: transaction-control statements (`BEGIN`, `COMMIT`, `ROLLBACK`)
+    /// drive the engine's explicit transaction. With an explicit transaction
+    /// open, DML is buffered and only durable at `COMMIT`; DDL is rejected
+    /// (it is autocommit by design and cannot be rolled back). Without one,
+    /// every statement remains autocommit.
     pub fn execute(&mut self, sql: &str) -> Result<ExecResult, String> {
+        self.execute_session(0, sql)
+    }
+
+    /// Parse + execute a single statement on behalf of `session` (one active
+    /// explicit transaction per session; multiple sessions may be active
+    /// concurrently). Statement execution is serialized by `&mut self`, but the
+    /// session's transaction — snapshot, pending writes and strict-2PL row
+    /// locks — is independent of every other session's, so two sessions can
+    /// write, roll back and commit concurrently without interfering.
+    pub fn execute_session(&mut self, session: SessionId, sql: &str) -> Result<ExecResult, String> {
         let stmts = parser::Parser::parse(sql)?;
         if stmts.len() != 1 {
             return Err(format!(
@@ -165,15 +230,36 @@ impl<W: Write> Engine<W> {
             ));
         }
         match &stmts[0] {
+            Statement::Begin => self.txn_begin(session),
+            Statement::Commit => self.txn_commit(session),
+            Statement::Rollback => self.txn_rollback(session),
+            Statement::CreateTable { .. }
+            | Statement::CreateIndex { .. }
+            | Statement::DropIndex { .. }
+                if self.active.contains_key(&session) =>
+            {
+                Err("DDL is not supported inside an explicit transaction; \
+                     commit or roll back first"
+                    .into())
+            }
             Statement::CreateTable {
                 name,
                 columns,
                 if_not_exists,
             } => self.create_table(name, columns, *if_not_exists),
-            Statement::Insert { table, rows } => self.insert(table, rows),
+            Statement::Insert { table, rows } => self.insert(session, table, rows),
+            Statement::Update { .. } => {
+                Err("execute: UPDATE is part of a later phase and is not yet implemented".into())
+            }
+            Statement::Delete { .. } => {
+                Err("execute: DELETE is part of a later phase and is not yet implemented".into())
+            }
             Statement::Select(sel) => {
-                let snap = self.db.snapshot();
-                self.select(sel, &snap)
+                let (snap, txn) = match self.active.get(&session) {
+                    Some(a) => (a.snap, Some(a.txn)),
+                    None => (self.db.snapshot(), None),
+                };
+                self.select(sel, &snap, txn)
             }
             Statement::CreateIndex {
                 name,
@@ -183,6 +269,132 @@ impl<W: Write> Engine<W> {
             Statement::DropIndex { name } => self.drop_index(name),
             Statement::ShowTables => self.show_tables(),
         }
+    }
+
+    /// True when `session` holds an explicit `BEGIN` transaction (the wire
+    /// server uses this to route a session's statements through the write path
+    /// so they observe the transaction's own writes).
+    pub fn session_in_transaction(&self, session: SessionId) -> bool {
+        self.active.contains_key(&session)
+    }
+
+    /// True when the embedded default session (0) holds an explicit
+    /// `BEGIN` transaction.
+    pub fn in_transaction(&self) -> bool {
+        self.active.contains_key(&0)
+    }
+
+    // ── R4 transaction control ───────────────────────────────────────────────
+
+    /// BEGIN — allocate a kernel transaction and snapshot for `session`. No
+    /// WAL record is emitted yet: this engine uses deferred commit logging, so
+    /// an explicit transaction only reaches the WAL atomically at COMMIT.
+    fn txn_begin(&mut self, session: SessionId) -> Result<ExecResult, String> {
+        if self.active.contains_key(&session) {
+            return Err("a transaction is already in progress".into());
+        }
+        let (txn, snap) = self.db.begin();
+        self.active.insert(
+            session,
+            ActiveTxn {
+                txn,
+                snap,
+                buffered: Vec::new(),
+            },
+        );
+        Ok(ExecResult::empty())
+    }
+
+    /// COMMIT — atomically persist `[Begin, Puts..., Commit]` to the WAL in a
+    /// single group (one sync = the durability point), publish the versions to
+    /// MVCC, then materialize indexes/columnar/page-store rows in write-ahead
+    /// order. On a write-write conflict the loser is aborted per
+    /// first-committer-wins.
+    fn txn_commit(&mut self, session: SessionId) -> Result<ExecResult, String> {
+        let Some(act) = self.active.remove(&session) else {
+            return Err("no transaction in progress".into());
+        };
+        let count = self.finish_commit(act.txn, act.buffered)?;
+        Ok(ExecResult {
+            columns: vec![],
+            rows: vec![],
+            rows_affected: count,
+        })
+    }
+
+    /// ROLLBACK — discard the kernel transaction's buffered writes (the MVCC
+    /// pending state) and any engine-side materialization buffers. Since
+    /// nothing was applied to indexes/columnar/pages during the transaction,
+    /// abort is a pure in-memory discard; an `Abort` record is written for an
+    /// auditable transaction boundary.
+    fn txn_rollback(&mut self, session: SessionId) -> Result<ExecResult, String> {
+        let Some(act) = self.active.remove(&session) else {
+            return Err("no transaction in progress".into());
+        };
+        self.db.abort(act.txn);
+        self.wal.append(&WalRecord::Abort { txn: act.txn });
+        let _ = self.wal.commit_group();
+        Ok(ExecResult::empty())
+    }
+
+    /// Shared commit tail: WAL-group the transaction, publish MVCC versions,
+    /// then materialize buffered rows into secondary indexes, columnar deltas
+    /// and persistent pages — always after the WAL durability point.
+    fn finish_commit(&mut self, txn: TxnId, buffered: Vec<BufferedRow>) -> Result<u64, String> {
+        let logged = self
+            .db
+            .commit::<String>(txn, |recs| {
+                for r in recs {
+                    self.wal.append(r);
+                }
+                self.wal
+                    .commit_group()
+                    .map(|_| ())
+                    .map_err(|e| format!("wal failure: {e:?}"))
+            })
+            .map_err(|e| format!("wal failure: {e}"))?;
+        if let Err(c) = logged {
+            // First-committer-wins: this writer lost a concurrent conflict
+            // on one of its keys. The kernel re-admitted the pending state,
+            // so abort it cleanly — no rows, indexes or pages leak.
+            self.db.abort(txn);
+            return Err(format!(
+                "transaction aborted: write-write conflict on key {:?} \
+                 (first-committer-wins)",
+                c.key
+            ));
+        }
+        // WAL is synced (write-ahead) — now apply the buffered rows to
+        // indexes, columnar deltas and the persistent page store.
+        for b in &buffered {
+            let schema = self
+                .tables
+                .get(&b.table)
+                .cloned()
+                .ok_or_else(|| format!("no table `{}`", b.table))?;
+            for (idx_name, def) in self.indexes.iter().filter(|(_, d)| d.table == b.table) {
+                let col_idx = col_pos(&schema, &def.column)?;
+                let v = &b.values[col_idx];
+                if *v != SqlValue::Null {
+                    match self.index_trees.get_mut(idx_name) {
+                        Some(tree) => {
+                            tree.insert(&index_key_encode(v).map_err(|e| e.to_string())?, b.rid)
+                        }
+                        None => return Err(format!("index `{idx_name}` tree missing")),
+                    }
+                }
+            }
+            if let Some(ref mut applier) = self.delta_applier {
+                let col_values: Vec<ColValue> =
+                    b.values.iter().map(sql_value_to_col_value).collect();
+                applier.append_row_to(&b.table, col_values);
+            }
+            if let Some(ref mut sm) = self.storage {
+                sm.insert_row(&b.table, &b.encoded)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(buffered.len() as u64)
     }
 
     /// Parse + execute a read-only statement (SELECT / SHOW TABLES).
@@ -202,7 +414,7 @@ impl<W: Write> Engine<W> {
         }
         let snap = self.db.snapshot();
         match &stmts[0] {
-            Statement::Select(sel) => self.select(sel, &snap),
+            Statement::Select(sel) => self.select(sel, &snap, None),
             Statement::ShowTables => self.show_tables(),
             _ => Err("statement requires a write connection (use execute)".into()),
         }
@@ -253,6 +465,10 @@ impl<W: Write> Engine<W> {
         }
         self.tables.insert(name.to_string(), cols.clone());
         self.next_row_id.entry(name.to_string()).or_insert(0);
+        // R3: register the table in persistent storage (post-WAL-fsync).
+        if let Some(ref mut sm) = self.storage {
+            sm.create_table(name).map_err(|e| e.to_string())?;
+        }
         // M9: Register table schema for columnar delta capture.
         if let Some(ref mut applier) = self.delta_applier {
             let schema = column_def_to_schema(name, &cols);
@@ -294,11 +510,18 @@ impl<W: Write> Engine<W> {
         // Backfill from existing rows.
         let mut tree = BTree::new();
         let snap = self.db.snapshot();
-        let rows = self.scan_table_rows(table, &schema, &snap);
-        for (rid, row) in rows.iter().enumerate() {
-            let v = &row[col_pos(&schema, &column)?];
-            if *v != SqlValue::Null {
-                tree.insert(&index_key_encode(v)?, rid as u64);
+        // R4-MVCC: iterate actual row ids rather than enumerating present
+        // rows — rolled-back transactions leave rid gaps, and a compressed
+        // enumeration would map lookups onto the wrong row keys.
+        for rid in 0..*self.next_row_id.get(table).unwrap_or(&0) {
+            let key = row_key(table, rid);
+            if let Some(raw) = self.db.get_raw(&key, &snap) {
+                if let Some(row) = decode_row(&raw, &schema) {
+                    let v = &row[col_pos(&schema, &column)?];
+                    if *v != SqlValue::Null {
+                        tree.insert(&index_key_encode(v)?, rid);
+                    }
+                }
             }
         }
 
@@ -330,16 +553,24 @@ impl<W: Write> Engine<W> {
         Ok(ExecResult::empty())
     }
 
-    fn insert(&mut self, table: &str, rows: &[Vec<Expr>]) -> Result<ExecResult, String> {
+    fn insert(
+        &mut self,
+        session: SessionId,
+        table: &str,
+        rows: &[Vec<Expr>],
+    ) -> Result<ExecResult, String> {
         let schema = self
             .tables
             .get(table)
             .cloned()
             .ok_or_else(|| format!("no table `{table}`"))?;
 
-        let (txn, _snap) = self.db.begin();
         let start_id = *self.next_row_id.entry(table.to_string()).or_insert(0);
         let mut count = 0u64;
+        // R4: collect evaluated + encoded rows; secondary indexes, columnar
+        // deltas and persistent pages are all materialized at COMMIT (via
+        // `finish_commit`), never during statement execution.
+        let mut buffered: Vec<BufferedRow> = Vec::with_capacity(rows.len());
         for row_expr in rows {
             if row_expr.len() != schema.len() {
                 return Err(format!(
@@ -361,58 +592,88 @@ impl<W: Write> Engine<W> {
                 row.push(v);
             }
             let rid = start_id + count;
-            self.db.set(txn, &row_key(table, rid), encode_row(&row));
-            // Maintain secondary indexes for the table.
-            let mut index_errors: Vec<String> = Vec::new();
-            for (idx_name, def) in self.indexes.iter().filter(|(_, def)| def.table == table) {
-                let col_idx = col_pos(&schema, &def.column)?;
-                let v = &row[col_idx];
-                if *v != SqlValue::Null {
-                    match self.index_trees.get_mut(idx_name) {
-                        Some(tree) => {
-                            tree.insert(&index_key_encode(v).map_err(|e| e.to_string())?, rid)
-                        }
-                        None => index_errors.push(format!("index `{idx_name}` tree missing")),
-                    }
-                }
-            }
-            if let Some(e) = index_errors.first() {
-                return Err(e.clone());
-            }
-            // M9: Capture row for columnar delta buffer.
-            if let Some(ref mut applier) = self.delta_applier {
-                let col_values: Vec<ColValue> = row.iter().map(sql_value_to_col_value).collect();
-                applier.append_row_to(table, col_values);
-            }
+            let row_bytes = encode_row(&row);
+            buffered.push(BufferedRow {
+                table: table.to_string(),
+                rid,
+                encoded: row_bytes.clone(),
+                values: row,
+            });
             count += 1;
         }
         *self.next_row_id.get_mut(table).unwrap() += count;
 
-        let logged = self
-            .db
-            .commit::<String>(txn, |recs| {
-                for r in recs {
-                    self.wal.append(r);
-                }
-                self.wal
-                    .commit_group()
-                    .map(|_| ())
-                    .map_err(|e| format!("wal failure: {e:?}"))
-            })
-            .map_err(|e| format!("wal failure: {e}"))?;
-        logged.map_err(|c| format!("conflict on {:?}", c.key))?;
+        // Explicit transaction: buffer rows in the kernel's pending set (own-
+        // write visibility) and hold them for COMMIT. The row keys are reserved
+        // by `next_row_id`, so a later statement in the same transaction never
+        // reuses them; a ROLLBACK simply leaves gaps in the id sequence.
+        //
+        // Strict 2PL: every row key is write-locked for the whole transaction.
+        // All keys are reserved up front (statement-atomic at the lock level)
+        // — a conflict fails the statement before any pending write lands, so
+        // a failed statement leaves no partial row state. The subsequent
+        // writes are re-entrant on the reserved locks.
+        if let Some(act) = self.active.get_mut(&session) {
+            for b in &buffered {
+                self.db
+                    .lock_write(act.txn, &row_key(table, b.rid))
+                    .map_err(|e| {
+                        format!("statement failed: row locked by another transaction ({e:?})")
+                    })?;
+            }
+            for b in &buffered {
+                self.db
+                    .set(act.txn, &row_key(table, b.rid), b.encoded.clone())
+                    .expect("row key is already write-locked by this transaction");
+            }
+            act.buffered.extend(buffered);
+            return Ok(ExecResult {
+                columns: vec![],
+                rows: vec![],
+                rows_affected: count,
+            });
+        }
 
-        Ok(ExecResult {
-            columns: vec![],
-            rows: vec![],
-            rows_affected: count,
-        })
+        // Autocommit: one implicit transaction per statement. A lock conflict
+        // aborts the implicit transaction outright — pending writes and locks
+        // are discarded, so the failed statement leaves no trace.
+        let (txn, _snap) = self.db.begin();
+        for b in &buffered {
+            if let Err(e) = self.db.set(txn, &row_key(table, b.rid), b.encoded.clone()) {
+                self.db.abort(txn);
+                return Err(format!(
+                    "statement failed: row locked by another transaction ({e:?})"
+                ));
+            }
+        }
+        match self.finish_commit(txn, buffered) {
+            Ok(committed) => {
+                if committed != count {
+                    return Err("internal error: commit count mismatch".into());
+                }
+                Ok(ExecResult {
+                    columns: vec![],
+                    rows: vec![],
+                    rows_affected: count,
+                })
+            }
+            Err(e) => {
+                // Do not leak the implicit transaction on statement failure.
+                self.db.abort(txn);
+                Err(e)
+            }
+        }
     }
 
-    fn select(&self, sel: &parser::Select, snap: &Snapshot) -> Result<ExecResult, String> {
+    fn select(
+        &self,
+        sel: &parser::Select,
+        snap: &Snapshot,
+        txn: Option<TxnId>,
+    ) -> Result<ExecResult, String> {
         // JOIN path.
         if matches!(&sel.from, TableRef::Join { .. }) {
-            return self.select_join(sel, snap);
+            return self.select_join(sel, snap, txn);
         }
 
         let table = match &sel.from {
@@ -426,39 +687,54 @@ impl<W: Write> Engine<W> {
             .ok_or_else(|| format!("no table `{table}`"))?;
 
         // M9: Columnar OLAP path — read from columnar segments if available.
-        if self.has_columnar_data(&table) {
+        // R4-MVCC: inside an explicit transaction the txn-aware MVCC row store
+        // must be read instead, so the transaction's own buffered writes stay
+        // visible alongside committed rows (columnar segments only ever hold
+        // committed, flushed data).
+        if txn.is_none() && self.has_columnar_data(&table) {
             let rows = self.read_columnar(&table, &schema)?;
             return self.run_select(sel, &schema, rows);
         }
 
         // GROUP BY path.
         if !sel.group_by.is_empty() {
-            return self.select_group_by(sel, &schema, &table, snap);
+            return self.select_group_by(sel, &schema, &table, snap, txn);
         }
 
         // Aggregate fast path (no GROUP BY).
         if let Some(aggs) = try_parse_aggregates(&sel.projection, &schema)? {
-            return self.select_aggregates(sel, &schema, &table, aggs, snap);
+            return self.select_aggregates(sel, &schema, &table, aggs, snap, txn);
         }
 
         // General pipeline over the MVCC row store.
         // P4c: index-assisted point lookup (top-level `col = literal`
         // conjunct backed by a secondary index).
-        if let Some((rows, residual)) = self.index_lookup(&table, &schema, &sel.selection, snap)? {
+        if let Some((rows, residual)) =
+            self.index_lookup(&table, &schema, &sel.selection, snap, txn)?
+        {
             let mut sel2 = sel.clone();
             sel2.selection = residual;
             return self.run_select(&sel2, &schema, rows);
         }
-        let rows = self.scan_table_rows(&table, &schema, snap);
+        let rows = self.scan_table_rows(&table, &schema, snap, txn);
         self.run_select(sel, &schema, rows)
     }
 
-    /// Materialized MVCC snapshot scan of an entire table.
-    fn scan_table_rows(&self, table: &str, schema: &[ColumnDef], snap: &Snapshot) -> Vec<Row> {
+    /// Materialized MVCC snapshot scan of an entire table. Inside an explicit
+    /// transaction the read is txn-aware: the transaction observes its own
+    /// buffered writes alongside committed versions, never another
+    /// transaction's uncommitted state.
+    fn scan_table_rows(
+        &self,
+        table: &str,
+        schema: &[ColumnDef],
+        snap: &Snapshot,
+        txn: Option<TxnId>,
+    ) -> Vec<Row> {
         let mut rows = Vec::new();
         for rid in 0..*self.next_row_id.get(table).unwrap_or(&0) {
             let key = row_key(table, rid);
-            if let Some(raw) = self.db.get_raw(&key, snap) {
+            if let Some(raw) = self.db.read(txn, &key, snap) {
                 if let Some(full) = decode_row(&raw, schema) {
                     rows.push(full);
                 }
@@ -480,7 +756,17 @@ impl<W: Write> Engine<W> {
         schema: &[ColumnDef],
         selection: &Option<Expr>,
         snap: &Snapshot,
+        txn: Option<TxnId>,
     ) -> Result<Option<IndexLookup>, String> {
+        // R4-MVCC: secondary index trees are materialized only at COMMIT
+        // (deferred materialization). Inside an explicit transaction they
+        // cannot reference the transaction's own buffered (uncommitted) rows,
+        // so index reads fall back to the txn-aware table scan, which merges
+        // own writes with the committed set under the transaction snapshot.
+        // Autocommit/fresh-snapshot reads keep the index fast path.
+        if txn.is_some() {
+            return Ok(None);
+        }
         let Some(pred) = selection else {
             return Ok(None);
         };
@@ -521,7 +807,7 @@ impl<W: Write> Engine<W> {
 
             let mut rows = Vec::new();
             for rid in rids {
-                if let Some(raw) = self.db.get_raw(&row_key(table, rid), snap) {
+                if let Some(raw) = self.db.read(txn, &row_key(table, rid), snap) {
                     if let Some(full) = decode_row(&raw, schema) {
                         rows.push(full);
                     }
@@ -598,8 +884,9 @@ impl<W: Write> Engine<W> {
         table: &str,
         aggs: Vec<Aggregate>,
         snap: &Snapshot,
+        txn: Option<TxnId>,
     ) -> Result<ExecResult, String> {
-        let rows = self.scan_table_rows(table, schema, snap);
+        let rows = self.scan_table_rows(table, schema, snap, txn);
         let mut filtered = Vec::new();
         for row in rows {
             match &sel.selection {
@@ -618,7 +905,12 @@ impl<W: Write> Engine<W> {
         })
     }
 
-    fn select_join(&self, sel: &parser::Select, snap: &Snapshot) -> Result<ExecResult, String> {
+    fn select_join(
+        &self,
+        sel: &parser::Select,
+        snap: &Snapshot,
+        txn: Option<TxnId>,
+    ) -> Result<ExecResult, String> {
         let (left, right, on_expr) = match &sel.from {
             TableRef::Join { left, right, on } => match left.as_ref() {
                 TableRef::Table(lt) => (lt.clone(), right.clone(), on.clone()),
@@ -681,8 +973,8 @@ impl<W: Write> Engine<W> {
         };
         let (li, ri) = (lside.0 as usize, rside.0 as usize);
 
-        let left_rows: Vec<Row> = self.scan_table_rows(&left, &lschema, snap);
-        let right_rows: Vec<Row> = self.scan_table_rows(&right, &rschema, snap);
+        let left_rows: Vec<Row> = self.scan_table_rows(&left, &lschema, snap, txn);
+        let right_rows: Vec<Row> = self.scan_table_rows(&right, &rschema, snap, txn);
 
         let mut op: Box<dyn Operator> = Box::new(HashJoin::new(
             Box::new(VecScan::new(left_rows)),
@@ -746,6 +1038,7 @@ impl<W: Write> Engine<W> {
         schema: &[ColumnDef],
         table: &str,
         snap: &Snapshot,
+        txn: Option<TxnId>,
     ) -> Result<ExecResult, String> {
         let mut key_idx = Vec::with_capacity(sel.group_by.len());
         for e in &sel.group_by {
@@ -812,7 +1105,7 @@ impl<W: Write> Engine<W> {
         let mut raw_rows: Vec<Row> = Vec::new();
         for rid in 0..*self.next_row_id.get(table).unwrap_or(&0) {
             let key = row_key(table, rid);
-            if let Some(raw) = self.db.get_raw(&key, snap) {
+            if let Some(raw) = self.db.read(txn, &key, snap) {
                 if let Some(full) = decode_row(&raw, schema) {
                     if let Some(pred) = &sel.selection {
                         if !is_true(&eval_expr(pred, schema, &full)?)? {
@@ -890,9 +1183,575 @@ impl<W: Write> Engine<W> {
             rows_affected: 0,
         })
     }
-}
 
-// == Durable database lifecycle (R2) =========================================
+    // ── R3 streaming batch query ─────────────────────────────────────────
+
+    /// Execute a SELECT through persistent storage using the batch pipeline.
+    ///
+    /// Streams results to `sink` in bounded batches (`BATCH_ROWS` rows at a
+    /// time).  For queries that require full materialization (ORDER BY,
+    /// GROUP BY, JOIN) the rows are first collected into memory from the
+    /// storage scan, then processed — memory usage is still bounded by the
+    /// underlying table size (same as the existing Volcano path), but the
+    /// scan itself never exceeds one page per batch step.
+    ///
+    /// **Usage:**
+    /// ```ignore
+    /// engine.stream_query("SELECT id, name FROM users WHERE id > 100", |batch| {
+    ///     // process batch
+    ///     Ok(())
+    /// })?;
+    /// ```
+    ///
+    /// Falls back to [`execute`](Self::execute) for DDL/DML and for queries
+    /// that require the MvccStore snapshot path.
+    pub fn stream_query(
+        &mut self,
+        sql: &str,
+        mut sink: impl FnMut(crate::batch::Batch) -> Result<(), String>,
+    ) -> Result<ExecResult, String> {
+        use crate::batch::{Batch, SelectionVector, DEFAULT_BATCH_SIZE};
+
+        let stmts = parser::Parser::parse(sql)?;
+        if stmts.len() != 1 {
+            return Err(format!(
+                "expected exactly one statement, got {}",
+                stmts.len()
+            ));
+        }
+        let Statement::Select(sel) = &stmts[0] else {
+            return Err("stream_query only supports SELECT statements".into());
+        };
+
+        if matches!(&sel.from, TableRef::Join { .. }) {
+            // ── INNER equi-join over persistent storage (R3-EXEC-2) ──
+            use crate::batch_ops::{BatchHashJoin, BatchVecScan};
+
+            let (left_t, right_t, on) = match &sel.from {
+                TableRef::Join { left, right, on } => match left.as_ref() {
+                    TableRef::Table(lt) => (lt.clone(), right.clone(), on.clone()),
+                    _ => return Err("stream_query: JOIN left side must be a table".into()),
+                },
+                _ => unreachable!(),
+            };
+            if left_t == right_t {
+                return Err("self-joins unsupported".into());
+            }
+            let lschema = self
+                .tables
+                .get(&left_t)
+                .cloned()
+                .ok_or_else(|| format!("no table `{left_t}`"))?;
+            let rschema = self
+                .tables
+                .get(&right_t)
+                .cloned()
+                .ok_or_else(|| format!("no table `{right_t}`"))?;
+
+            let Expr::BinaryOp {
+                left: on_l,
+                op: BinOp::Eq,
+                right: on_r,
+            } = &on
+            else {
+                return Err("JOIN ON must be an equality".into());
+            };
+            let Expr::Identifier(lname) = on_l.as_ref() else {
+                return Err("JOIN ON sides must be columns".into());
+            };
+            let Expr::Identifier(rname) = on_r.as_ref() else {
+                return Err("JOIN ON sides must be columns".into());
+            };
+            let find_side = |name: &str| -> Option<(u8, usize)> {
+                let mut hit = None;
+                if let Some(p) = lschema.iter().position(|c| c.name == name) {
+                    hit = Some((0u8, p));
+                }
+                if let Some(p) = rschema.iter().position(|c| c.name == name) {
+                    if hit.is_some() {
+                        return None;
+                    }
+                    hit = Some((1u8, p));
+                }
+                hit
+            };
+            let (at, ai) = find_side(lname).ok_or_else(|| format!("unknown column {lname}"))?;
+            let (bt, bi) = find_side(rname).ok_or_else(|| format!("unknown column {rname}"))?;
+            if at == bt {
+                return Err("JOIN ON must span both tables".into());
+            }
+            // Probe side is the FROM-left table; resolve its key index.
+            let (lkey, rkey) = if at == 0 { (ai, bi) } else { (bi, ai) };
+
+            let combined: Vec<ColumnDef> = lschema.iter().chain(rschema.iter()).cloned().collect();
+            let (exprs, out_cols) = projection_specs(sel, &combined)?;
+
+            let sm = self
+                .storage
+                .as_mut()
+                .ok_or("storage not enabled (use create_db or open_db)")?;
+
+            // Both inputs are materialized from persistent storage and then
+            // run through the batch hash-join operator (build = right side).
+            let mut read_rows = |tbl: &str, sch: &[ColumnDef]| -> Result<Vec<Row>, String> {
+                let mut rows = Vec::new();
+                let mut it = sm.scan_rows(tbl).map_err(|e| e.to_string())?;
+                while let Some(raw) = it.next_row().map_err(|e| e.to_string())? {
+                    if let Some(r) = decode_row(&raw, sch) {
+                        rows.push(r);
+                    }
+                }
+                Ok(rows)
+            };
+            let left_rows = read_rows(&left_t, &lschema)?;
+            let right_rows = read_rows(&right_t, &rschema)?;
+
+            let mut join: Box<dyn crate::batch_ops::BatchOperator> = Box::new(BatchHashJoin::new(
+                Box::new(BatchVecScan::new(left_rows)),
+                Box::new(BatchVecScan::new(right_rows)),
+                lkey,
+                rkey,
+                lschema.len(),
+            )?);
+
+            // Pull joined rows (combined layout) → WHERE → ORDER BY → project → LIMIT.
+            let mut rows: Vec<Row> = Vec::new();
+            loop {
+                let batch = join.next_batch(DEFAULT_BATCH_SIZE)?;
+                let Some(batch) = batch else {
+                    break;
+                };
+                for i in 0..batch.num_rows() {
+                    let row = batch.row(i);
+                    let keep = match &sel.selection {
+                        Some(pred) => is_true(&eval_expr(pred, &combined, &row)?)?,
+                        None => true,
+                    };
+                    if keep {
+                        rows.push(row);
+                    }
+                }
+            }
+
+            if !sel.order_by.is_empty() {
+                let c = combined.clone();
+                let keys: Vec<Expr> = sel.order_by.iter().map(|o| o.expr.clone()).collect();
+                let desc: Vec<bool> = sel.order_by.iter().map(|o| !o.asc).collect();
+                rows.sort_by(|a, b| {
+                    let mut ord = std::cmp::Ordering::Equal;
+                    for (i, e) in keys.iter().enumerate() {
+                        let ka = eval_expr(e, &c, a).unwrap_or(SqlValue::Null);
+                        let kb = eval_expr(e, &c, b).unwrap_or(SqlValue::Null);
+                        let mut o = crate::codec::total_cmp(&ka, &kb);
+                        if desc.get(i).copied().unwrap_or(false) {
+                            o = o.reverse();
+                        }
+                        if o != std::cmp::Ordering::Equal {
+                            ord = o;
+                            break;
+                        }
+                    }
+                    ord
+                });
+            }
+
+            if let Some(n) = sel.limit {
+                rows.truncate(n);
+            }
+
+            let c = combined.clone();
+            let mut buf: Vec<Row> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
+            let mut total: u64 = 0;
+            for row in rows {
+                let mut out = Vec::with_capacity(exprs.len());
+                for e in &exprs {
+                    out.push(eval_expr(e, &c, &row)?);
+                }
+                buf.push(out);
+                if buf.len() >= DEFAULT_BATCH_SIZE {
+                    total += buf.len() as u64;
+                    sink(crate::batch::rows_to_batch(std::mem::replace(
+                        &mut buf,
+                        Vec::with_capacity(DEFAULT_BATCH_SIZE),
+                    )))?;
+                }
+            }
+            if !buf.is_empty() {
+                total += buf.len() as u64;
+                sink(crate::batch::rows_to_batch(buf))?;
+            }
+
+            return Ok(ExecResult {
+                columns: out_cols,
+                rows: vec![],
+                rows_affected: total,
+            });
+        }
+
+        let table = match &sel.from {
+            TableRef::Table(t) => t.clone(),
+            _ => unreachable!(),
+        };
+        let schema = self
+            .tables
+            .get(&table)
+            .cloned()
+            .ok_or_else(|| format!("no table `{table}`"))?;
+        let (exprs, out_cols) = projection_specs(sel, &schema)?;
+
+        let has_agg_or_group = !sel.group_by.is_empty() || exprs.iter().any(contains_aggregate);
+
+        if has_agg_or_group {
+            use crate::batch_ops::BatchAggregate as BatchAgg;
+            use crate::codec::total_cmp;
+
+            let mut key_idx = Vec::with_capacity(sel.group_by.len());
+            for e in &sel.group_by {
+                let Expr::Identifier(id) = e else {
+                    return Err("GROUP BY supports plain columns only".into());
+                };
+                key_idx.push(col_pos(&schema, id)?);
+            }
+
+            enum GItem {
+                Key(usize),
+                Agg,
+            }
+            let mut items: Vec<GItem> = Vec::new();
+            let mut agg_desc: Vec<(crate::executor::AggFn, Option<usize>)> = Vec::new();
+
+            for expr in &exprs {
+                match expr {
+                    Expr::Function { name, args } => {
+                        let fname = name.to_uppercase();
+                        let func = match fname.as_str() {
+                            "COUNT" => crate::executor::AggFn::Count,
+                            "SUM" => crate::executor::AggFn::Sum,
+                            "AVG" => crate::executor::AggFn::Avg,
+                            "MIN" => crate::executor::AggFn::Min,
+                            "MAX" => crate::executor::AggFn::Max,
+                            other => return Err(format!("unsupported function {other}")),
+                        };
+                        let col = if args.is_empty() {
+                            None
+                        } else {
+                            let Expr::Identifier(col_name) = &args[0] else {
+                                return Err(format!("{fname} requires a column or *"));
+                            };
+                            if col_name == "*" {
+                                None
+                            } else {
+                                Some(col_pos(&schema, col_name)?)
+                            }
+                        };
+                        agg_desc.push((func, col));
+                        items.push(GItem::Agg);
+                    }
+                    Expr::Identifier(id) => {
+                        let pos = col_pos(&schema, id)?;
+                        if !key_idx.contains(&pos) {
+                            return Err(format!(
+                                "column {id} must appear in GROUP BY or be aggregated",
+                            ));
+                        }
+                        items.push(GItem::Key(pos));
+                    }
+                    other => return Err(format!("unsupported GROUP BY projection {other:?}")),
+                }
+            }
+
+            let nkeys = key_idx.len();
+            let mut reorder: Vec<usize> = Vec::with_capacity(items.len());
+            let mut agg_counter = 0usize;
+            for item in &items {
+                match item {
+                    GItem::Key(pos) => {
+                        reorder.push(key_idx.iter().position(|&i| i == *pos).unwrap());
+                    }
+                    GItem::Agg => {
+                        reorder.push(nkeys + agg_counter);
+                        agg_counter += 1;
+                    }
+                }
+            }
+
+            let sm = self
+                .storage
+                .as_mut()
+                .ok_or("storage not enabled (use create_db or open_db)")?;
+            let mut iter = sm.scan_rows(&table).map_err(|e| e.to_string())?;
+            let mut scan_rows: Vec<Row> = Vec::new();
+            while let Some(raw) = iter.next_row().map_err(|e| e.to_string())? {
+                if let Some(row) = decode_row(&raw, &schema) {
+                    let keep = match &sel.selection {
+                        Some(pred) => is_true(&eval_expr(pred, &schema, &row)?)?,
+                        None => true,
+                    };
+                    if keep {
+                        scan_rows.push(row);
+                    }
+                }
+            }
+            drop(iter);
+
+            let is_grouped = !key_idx.is_empty();
+            let agg_desc_empty = agg_desc.clone();
+            let input: Box<dyn crate::batch_ops::BatchOperator> =
+                Box::new(crate::batch_ops::BatchVecScan::new(scan_rows));
+
+            let mut op: Box<dyn crate::batch_ops::BatchOperator> =
+                Box::new(BatchAgg::new(input, key_idx, agg_desc));
+
+            let mut all_rows: Vec<Row> = Vec::new();
+            loop {
+                let batch = op.next_batch(DEFAULT_BATCH_SIZE)?;
+                let Some(batch) = batch else {
+                    break;
+                };
+                for i in 0..batch.num_rows() {
+                    let row = batch.row(i);
+                    let mut out = Vec::with_capacity(reorder.len());
+                    for &p in &reorder {
+                        out.push(row[p].clone());
+                    }
+                    all_rows.push(out);
+                }
+            }
+
+            // Ungrouped aggregate over an empty input still produces one row
+            // (SQL semantics, matching the Volcano `select_aggregates` path):
+            // COUNT(*) / COUNT(col) are 0; value aggregates are NULL.
+            if all_rows.is_empty() && !is_grouped {
+                let mut row: Row = Vec::with_capacity(agg_desc_empty.len());
+                for (f, _col) in &agg_desc_empty {
+                    row.push(match f {
+                        crate::executor::AggFn::Count => SqlValue::Int(0),
+                        _ => SqlValue::Null,
+                    });
+                }
+                all_rows.push(row);
+            }
+
+            if !sel.order_by.is_empty() {
+                let mut positions = Vec::new();
+                let mut desc = Vec::new();
+                for ob in &sel.order_by {
+                    let pos = grouped_order_index(&ob.expr, &out_cols)?;
+                    positions.push(pos);
+                    desc.push(!ob.asc);
+                }
+                all_rows.sort_by(|a, b| {
+                    let mut ord = std::cmp::Ordering::Equal;
+                    for (i, &pos) in positions.iter().enumerate() {
+                        let mut o = total_cmp(&a[pos], &b[pos]);
+                        if desc[i] {
+                            o = o.reverse();
+                        }
+                        if o != std::cmp::Ordering::Equal {
+                            ord = o;
+                            break;
+                        }
+                    }
+                    ord
+                });
+            }
+
+            if let Some(n) = sel.limit {
+                all_rows.truncate(n);
+            }
+
+            let mut buf: Vec<Row> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
+            let mut total_rows: u64 = 0;
+            for row in all_rows {
+                buf.push(row);
+                if buf.len() >= DEFAULT_BATCH_SIZE {
+                    total_rows += buf.len() as u64;
+                    sink(crate::batch::rows_to_batch(std::mem::replace(
+                        &mut buf,
+                        Vec::with_capacity(DEFAULT_BATCH_SIZE),
+                    )))?;
+                }
+            }
+            if !buf.is_empty() {
+                total_rows += buf.len() as u64;
+                sink(crate::batch::rows_to_batch(buf))?;
+            }
+
+            return Ok(ExecResult {
+                columns: out_cols,
+                rows: vec![],
+                rows_affected: total_rows,
+            });
+        }
+
+        // ── streaming path (no ORDER BY): read pages → apply WHERE → project ──
+        if sel.order_by.is_empty() {
+            let sm = self
+                .storage
+                .as_mut()
+                .ok_or("storage not enabled (use create_db or open_db)")?;
+            let mut iter = sm.scan_rows(&table).map_err(|e| e.to_string())?;
+            let batch_size = DEFAULT_BATCH_SIZE;
+            let mut total_rows: u64 = 0;
+            let mut limit_rem = sel.limit;
+            let s = schema.clone();
+
+            loop {
+                let take = limit_rem.unwrap_or(batch_size).min(batch_size);
+                if take == 0 {
+                    break;
+                }
+                // Pull raw rows and decode into a batch.
+                let mut batch = Batch::with_capacity(schema.len(), take);
+                for _ in 0..take {
+                    match iter.next_row() {
+                        Ok(Some(raw)) => {
+                            if let Some(row) = decode_row(&raw, &schema) {
+                                batch.push_row(&row);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => return Err(e.to_string()),
+                    }
+                }
+                if batch.is_empty() {
+                    break;
+                }
+
+                // WHERE: inline selection vector (avoids materializing
+                // rejected rows).
+                if let Some(ref pred) = sel.selection {
+                    let mut sv = SelectionVector::new();
+                    for i in 0..batch.num_rows() {
+                        let row = batch.row(i);
+                        if is_true(&eval_expr(pred, &schema, &row)?)? {
+                            sv.push(i);
+                        }
+                    }
+                    if sv.is_empty() {
+                        continue;
+                    }
+                    batch = batch.apply_selection(sv.as_slice());
+                }
+
+                let filtered_count = batch.num_rows();
+
+                // Projection (expression-based, row-level).
+                let mut proj_batch = Batch::with_capacity(exprs.len(), filtered_count);
+                for i in 0..filtered_count {
+                    let row = batch.row(i);
+                    let mut out = Vec::with_capacity(exprs.len());
+                    for e in &exprs {
+                        out.push(eval_expr(e, &s, &row)?);
+                    }
+                    proj_batch.push_row(&out);
+                }
+
+                // Limit truncation.
+                if let Some(ref mut n) = limit_rem {
+                    let take = (*n).min(proj_batch.num_rows());
+                    if take < proj_batch.num_rows() {
+                        let truncated: Vec<Row> = (0..take).map(|i| proj_batch.row(i)).collect();
+                        proj_batch = crate::batch::rows_to_batch(truncated);
+                    }
+                    *n = n.saturating_sub(proj_batch.num_rows());
+                }
+
+                total_rows += proj_batch.num_rows() as u64;
+                sink(proj_batch)?;
+            }
+
+            return Ok(ExecResult {
+                columns: out_cols,
+                rows: vec![],
+                rows_affected: total_rows,
+            });
+        }
+
+        // ── materialized path (ORDER BY present): collect → sort → emit ──
+        let sm = self
+            .storage
+            .as_mut()
+            .ok_or("storage not enabled (use create_db or open_db)")?;
+        let mut iter = sm.scan_rows(&table).map_err(|e| e.to_string())?;
+        let batch_size = DEFAULT_BATCH_SIZE;
+        let mut all_rows: Vec<Row> = Vec::new();
+
+        loop {
+            match iter.next_row() {
+                Ok(Some(raw)) => {
+                    if let Some(row) = decode_row(&raw, &schema) {
+                        // WHERE inline.
+                        let keep = match &sel.selection {
+                            Some(pred) => is_true(&eval_expr(pred, &schema, &row)?)?,
+                            None => true,
+                        };
+                        if keep {
+                            all_rows.push(row);
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+
+        // Sort (stable, nulls-last, PostgreSQL default).
+        if !sel.order_by.is_empty() {
+            let s = schema.clone();
+            let keys: Vec<Expr> = sel.order_by.iter().map(|o| o.expr.clone()).collect();
+            let desc: Vec<bool> = sel.order_by.iter().map(|o| !o.asc).collect();
+            all_rows.sort_by(|a, b| {
+                let mut ord = std::cmp::Ordering::Equal;
+                for (i, e) in keys.iter().enumerate() {
+                    let ka = eval_expr(e, &s, a).unwrap_or(SqlValue::Null);
+                    let kb = eval_expr(e, &s, b).unwrap_or(SqlValue::Null);
+                    let mut o = crate::codec::total_cmp(&ka, &kb);
+                    if desc.get(i).copied().unwrap_or(false) {
+                        o = o.reverse();
+                    }
+                    if o != std::cmp::Ordering::Equal {
+                        ord = o;
+                        break;
+                    }
+                }
+                ord
+            });
+        }
+
+        // Limit.
+        if let Some(n) = sel.limit {
+            all_rows.truncate(n);
+        }
+
+        // Project and emit.
+        let total = all_rows.len() as u64;
+        let s = schema.clone();
+        let mut buf = Vec::with_capacity(batch_size);
+        for row in all_rows {
+            let mut out = Vec::with_capacity(exprs.len());
+            for e in &exprs {
+                out.push(eval_expr(e, &s, &row)?);
+            }
+            buf.push(out);
+            if buf.len() >= batch_size {
+                sink(crate::batch::rows_to_batch(std::mem::replace(
+                    &mut buf,
+                    Vec::with_capacity(batch_size),
+                )))?;
+            }
+        }
+        if !buf.is_empty() {
+            sink(crate::batch::rows_to_batch(buf))?;
+        }
+
+        Ok(ExecResult {
+            columns: out_cols,
+            rows: vec![],
+            rows_affected: total,
+        })
+    }
+}
 
 /// WAL durability hook for file-backed databases: push committed groups
 /// across the OS durability boundary via `sync_data` (R2.3).
@@ -919,6 +1778,11 @@ impl Engine<std::fs::File> {
             .truncate(false)
             .append(true)
             .open(crate::dbdir::wal_path(root))?;
+        let storage = StorageManager::new(BufferPool::new(
+            FilePageStore::open(root.join(crate::dbdir::TABLES_DIR))?,
+            256,
+        ));
+        // Fresh database: no tables yet.
         Ok(Self {
             db: MvccStore::new(),
             wal: WalWriter::with_syncer(wal_file, sync_file),
@@ -929,6 +1793,8 @@ impl Engine<std::fs::File> {
             columnar_dir: None,
             delta_applier: None,
             columnar_flush_threshold: 10_000,
+            storage: Some(storage),
+            active: HashMap::new(),
         })
     }
 
@@ -1052,6 +1918,35 @@ impl Engine<std::fs::File> {
         let mut wal = WalWriter::with_syncer(wal_file, sync_file);
         wal.resume(recovered_count as u64 + 1);
 
+        // ── R3 storage: rebuild persistent tables from the recovered state. ──
+        // The WAL remains the recovery authority (R2); the page store is
+        // derived so a page scan is never missing historical rows.
+        // Wipe stale pages from a prior session (the WAL is the source of truth).
+        let tables_dir = root.join(crate::dbdir::TABLES_DIR);
+        if tables_dir.exists() {
+            std::fs::remove_dir_all(&tables_dir)?;
+        }
+        std::fs::create_dir_all(&tables_dir)?;
+        let mut storage =
+            StorageManager::new(BufferPool::new(FilePageStore::open(tables_dir)?, 256));
+        // Rebuild in deterministic (sorted) name order so reconstructed table
+        // ids and page allocation are stable across reopen/recovery cycles.
+        let mut table_names: Vec<&String> = tables.keys().collect();
+        table_names.sort();
+        for table_name in table_names {
+            storage
+                .create_table(table_name)
+                .map_err(|e| KError::Other(format!("storage rebuild: {e}")))?;
+            let n = *next_row_id.get(table_name).unwrap_or(&0);
+            for rid in 0..n {
+                if let Some(raw) = db.get_raw(&row_key(table_name, rid), &snap) {
+                    storage
+                        .insert_row(table_name, &raw)
+                        .map_err(|e| KError::Other(format!("storage rebuild: {e}")))?;
+                }
+            }
+        }
+
         Ok(Self {
             db,
             wal,
@@ -1062,16 +1957,22 @@ impl Engine<std::fs::File> {
             columnar_dir: None,
             delta_applier: None,
             columnar_flush_threshold: 10_000,
+            storage: Some(storage),
+            active: HashMap::new(),
         })
     }
 
-    /// Clean shutdown (R2.12): flush and sync any pending WAL group and
-    /// release the log file. Recovery never depends on this method being
-    /// called — `close` is a courtesy; crash safety comes from the log.
-    pub fn close(self) -> Result<(), KError> {
-        let Engine { wal, .. } = self;
-        let mut wal = wal;
-        wal.commit_group()?;
+    /// Clean shutdown (R2.12 / R3.8): flush and sync any pending WAL group,
+    /// then flush dirty storage pages to disk, and release the log file.
+    /// Recovery never depends on this method being called — crash safety
+    /// comes from the WAL (write-ahead: the WAL is synced before any page
+    /// flush, so page data never leads the log).
+    pub fn close(mut self) -> Result<(), KError> {
+        self.wal.commit_group()?;
+        if let Some(ref mut sm) = self.storage {
+            sm.flush()
+                .map_err(|e| KError::Other(format!("storage flush: {e}")))?;
+        }
         Ok(())
     }
 }
@@ -1406,6 +2307,18 @@ fn projection_specs(
         cols.push(format_expr(e));
     }
     Ok((exprs, cols))
+}
+
+fn contains_aggregate(e: &Expr) -> bool {
+    match e {
+        Expr::Function { name, args } => {
+            let up = name.to_uppercase();
+            matches!(up.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+                || args.iter().any(contains_aggregate)
+        }
+        Expr::BinaryOp { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
+        _ => false,
+    }
 }
 
 /// Resolve a GROUP BY ORDER BY expression against the post-aggregation

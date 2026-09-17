@@ -14,6 +14,9 @@
 //!   record) to the WAL tail, then crash
 //! - `verify-count <dir> <t>`     open, print `SELECT COUNT(*)` for `t`, exit 0
 //! - `verify-lookup <dir> <t> <col> <val>` open, print range/equality count, exit 0
+//! - `verify-stream <dir>`        open, cross-check EVERY table's rebuilt page
+//!   store (stream_query) against the WAL-recovered MVCC rows (execute); exit
+//!   0 only if both agree for all tables (R3 storage rebuild regression)
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -145,6 +148,43 @@ fn main() {
                 &mut db,
                 &format!("SELECT COUNT(*) FROM {table} WHERE {column} = '{value}'"),
             );
+            db.close().expect("close");
+            die(0);
+        }
+        "verify-stream" => {
+            let mut db = open_verify(&dir);
+            // R3-STORAGE regression: after crash recovery the page store is
+            // rebuilt from the WAL-recovered MVCC state. Compare every table's
+            // stream_query (page scan) against execute (MVCC) row-for-row;
+            // a mismatch means the rebuilt page storage diverged from the log.
+            let show: Vec<String> = db
+                .execute("SHOW TABLES")
+                .expect("show tables")
+                .rows
+                .into_iter()
+                .map(|r| match &r[0] {
+                    SqlValue::Text(t) => t.clone(),
+                    other => panic!("fixture: unexpected SHOW TABLES value {other:?}"),
+                })
+                .collect();
+            for table in show {
+                let sql = format!("SELECT * FROM {table}");
+                let via_mvcc = db.execute(&sql).expect("execute");
+                let mut via_pages: Vec<Vec<SqlValue>> = Vec::new();
+                db.stream_query(&sql, |b| {
+                    for i in 0..b.num_rows() {
+                        via_pages.push(b.row(i));
+                    }
+                    Ok(())
+                })
+                .expect("stream_query");
+                if via_mvcc.rows != via_pages {
+                    eprintln!(
+                        "fixture: verify-stream: table `{table}` mismatch:\n  mvcc = {via_mvcc:?}\n  pages = {via_pages:?}"
+                    );
+                    die(1);
+                }
+            }
             db.close().expect("close");
             die(0);
         }

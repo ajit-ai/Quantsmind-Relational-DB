@@ -356,13 +356,22 @@ fn mvcc_snapshot_isolation_matches_serial_history() {
                 let key = rng.below(8) as u8;
                 let value = rng.next() >> 32;
                 let (txn, snap) = store.begin();
-                store.set(txn, &kbyte(key), bval(value));
-                assert_eq!(
-                    store.get(txn, &kbyte(key), &snap),
-                    Some(bval(value)),
-                    "read-your-own-writes broken"
-                );
-                inflight.push((txn, key, value, snap.read_ts));
+                match store.set(txn, &kbyte(key), bval(value)) {
+                    Ok(()) => {
+                        assert_eq!(
+                            store.get(txn, &kbyte(key), &snap),
+                            Some(bval(value)),
+                            "read-your-own-writes broken"
+                        );
+                        inflight.push((txn, key, value, snap.read_ts));
+                    }
+                    Err(_) => {
+                        // Strict 2PL: another live writer already holds the key
+                        // (no two in-flight writers share a key). The conflict
+                        // is deterministic and non-blocking — abort immediately.
+                        store.abort(txn);
+                    }
+                }
             }
             3..=7 => {
                 // resolve one writer: commit or abort
@@ -453,7 +462,7 @@ fn mvcc_wal_crash_recovers_exactly_the_committed_survivors() {
         let key = rng.below(8) as u8;
         let value = rng.next() >> 32;
         let (txn, _snap) = store.begin();
-        store.set(txn, &kbyte(key), bval(value));
+        store.set(txn, &kbyte(key), bval(value)).unwrap();
 
         let mut span: Option<(usize, usize)> = None;
         match store

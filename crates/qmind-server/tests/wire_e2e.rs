@@ -1,7 +1,8 @@
 //! M5: full wire-protocol roundtrip over real TCP sockets.
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, RwLock};
+use std::sync::{mpsc, Arc, RwLock};
+use std::time::Duration;
 
 fn start_server() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -47,6 +48,13 @@ fn read_until_ready(s: &mut TcpStream) {
 }
 
 fn query(s: &mut TcpStream, sql: &str) -> Vec<Vec<String>> {
+    match query_result(s, sql) {
+        Ok(r) => r,
+        Err(e) => panic!("server error for {sql}: {e}"),
+    }
+}
+
+fn query_result(s: &mut TcpStream, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let body = cstr(sql);
     let mut m = vec![b'Q'];
     m.extend_from_slice(&((body.len() as i32 + 4).to_be_bytes()));
@@ -54,7 +62,8 @@ fn query(s: &mut TcpStream, sql: &str) -> Vec<Vec<String>> {
     s.write_all(&m).unwrap();
 
     let mut rows = Vec::new();
-    loop {
+    let mut read_err = None;
+    for _ in 0.. {
         let mut t = [0u8; 1];
         s.read_exact(&mut t).unwrap();
         let mut l = [0u8; 4];
@@ -77,11 +86,37 @@ fn query(s: &mut TcpStream, sql: &str) -> Vec<Vec<String>> {
                 }
                 rows.push(cells);
             }
-            b'E' => panic!("server error for {sql}"),
-            b'Z' => return rows,
+            b'E' => {
+                // ErrorResponse body: 'S' + severity \0 ... 'M' + message \0 ... 0
+                let mut pos = 0usize;
+                let mut msg = String::new();
+                while pos < b.len() && b[pos] != 0 {
+                    let code = b[pos];
+                    pos += 1;
+                    let end = b[pos..]
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(b.len() - pos);
+                    let val = String::from_utf8_lossy(&b[pos..pos + end]).to_string();
+                    if code == b'M' {
+                        msg = val;
+                    }
+                    pos += end + 1;
+                }
+                // Remember the error but keep draining until ReadyState so the
+                // stream isn't left desynchronized for the next query.
+                read_err = Some(msg);
+            }
+            b'Z' => {
+                if let Some(msg) = read_err {
+                    return Err(msg);
+                }
+                return Ok(rows);
+            }
             _ => {}
         }
     }
+    unreachable!("packet loop is infinite")
 }
 
 #[test]
@@ -141,4 +176,407 @@ fn concurrent_readers_never_see_torn_writes() {
         h.join().unwrap();
     }
     writer.join().unwrap();
+}
+
+#[test]
+fn transaction_session_sees_own_writes_others_see_committed_only() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE txn_t (id INTEGER, v TEXT);");
+
+    // Session 1 begins a transaction and inserts.
+    query(&mut c1, "BEGIN;");
+    query(&mut c1, "INSERT INTO txn_t VALUES (1, 'uncommitted');");
+    // Own writes are visible on the owning session across packets.
+    let rows = query(&mut c1, "SELECT v FROM txn_t;");
+    assert_eq!(rows, vec![vec!["uncommitted".to_string()]]);
+
+    // Session 2 (foreign) must NOT observe the uncommitted row.
+    let mut c2 = connect(port);
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM txn_t;");
+    assert_eq!(rows, vec![vec!["0".to_string()]]);
+
+    // Session 1 commits; session 2 now sees it.
+    query(&mut c1, "COMMIT;");
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM txn_t;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+    let rows = query(&mut c1, "SELECT v FROM txn_t;");
+    assert_eq!(rows, vec![vec!["uncommitted".to_string()]]);
+}
+
+#[test]
+fn foreign_writes_are_not_blocked_while_a_transaction_is_held() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE txn_t2 (id INTEGER);");
+
+    query(&mut c1, "BEGIN;");
+    query(&mut c1, "INSERT INTO txn_t2 VALUES (1);");
+
+    // R4-MULTIWRITER: a foreign session's write is no longer rejected — it
+    // runs in autocommit on a disjoint physical row while the owner's
+    // transaction stays open.
+    let mut c2 = connect(port);
+    query(&mut c2, "INSERT INTO txn_t2 VALUES (2);");
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM txn_t2;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    // The owner still sees only its own row (snapshot isolation).
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM txn_t2;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    // Rollback removes only the owner's row; the foreign writer's survives.
+    query(&mut c1, "ROLLBACK;");
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM txn_t2;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM txn_t2;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+}
+
+#[test]
+fn foreign_session_never_sees_uncommitted_owner_rows() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE vis (id INTEGER, v TEXT);");
+    query(&mut c1, "CREATE INDEX iv ON vis (v);");
+
+    // Owner inserts, scans and index-looks-up its own uncommitted row.
+    query(&mut c1, "BEGIN;");
+    query(&mut c1, "INSERT INTO vis VALUES (1, 'secret');");
+    let rows = query(&mut c1, "SELECT id FROM vis WHERE v = 'secret';");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "owner sees own uncommitted row"
+    );
+
+    // Foreign session: both scan and index reads must stay empty.
+    let mut c2 = connect(port);
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM vis;");
+    assert_eq!(rows, vec![vec!["0".to_string()]]);
+    let rows = query(&mut c2, "SELECT id FROM vis WHERE v = 'secret';");
+    assert!(rows.is_empty(), "foreign index read leaked uncommitted row");
+
+    // Owner commits; the foreign session now observes the row.
+    query(&mut c1, "COMMIT;");
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM vis;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+    let rows = query(&mut c2, "SELECT id FROM vis WHERE v = 'secret';");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+}
+
+#[test]
+fn owner_snapshot_view_is_stable_while_foreign_writer_commits() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE stab (id INTEGER);");
+    query(&mut c1, "INSERT INTO stab VALUES (1), (2), (3);");
+
+    query(&mut c1, "BEGIN;");
+    let before = query(&mut c1, "SELECT COUNT(*) FROM stab;");
+    assert_eq!(before, vec![vec!["3".to_string()]]);
+
+    // A foreign writer commits a new row while the owner's transaction is
+    // open. The owner's pinned BEGIN-time snapshot must not observe it.
+    let mut c2 = connect(port);
+    query(&mut c2, "INSERT INTO stab VALUES (9);");
+    assert_eq!(
+        query(&mut c2, "SELECT COUNT(*) FROM stab;"),
+        vec![vec!["4".to_string()]]
+    );
+
+    let after = query(&mut c1, "SELECT COUNT(*) FROM stab;");
+    assert_eq!(
+        after, before,
+        "owner's snapshot view must not change mid-transaction"
+    );
+
+    query(&mut c1, "COMMIT;");
+
+    // After COMMIT a fresh statement on the same session sees the foreign row.
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM stab;");
+    assert_eq!(rows, vec![vec!["4".to_string()]]);
+}
+
+#[test]
+fn rolled_back_owner_rows_invisible_to_foreign_session() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE rb (id INTEGER, v TEXT);");
+
+    query(&mut c1, "BEGIN;");
+    query(&mut c1, "INSERT INTO rb VALUES (1, 'doomed');");
+    let mut c2 = connect(port);
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM rb;");
+    assert_eq!(rows, vec![vec!["0".to_string()]]);
+
+    query(&mut c1, "ROLLBACK;");
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM rb;");
+    assert_eq!(
+        rows,
+        vec![vec!["0".to_string()]],
+        "rollback hides the write"
+    );
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM rb;");
+    assert_eq!(rows, vec![vec!["0".to_string()]]);
+}
+
+#[test]
+fn disconnected_owner_transaction_is_rolled_back_and_others_unaffected() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE owned (id INTEGER);");
+
+    // The owning session begins, writes, and drops the socket without an
+    // explicit COMMIT or ROLLBACK.
+    query(&mut c1, "BEGIN;");
+    query(&mut c1, "INSERT INTO owned VALUES (1);");
+    drop(c1);
+
+    // The server must roll the abandoned transaction back asynchronously; the
+    // row must disappear and no other session may ever be blocked by it. The
+    // rollback happens on the server's connection thread, so poll until it
+    // lands (bounded retries, no sleeps).
+    let mut c2 = connect(port);
+    let mut gone = false;
+    for _ in 0..200 {
+        let rows = query(&mut c2, "SELECT COUNT(*) FROM owned;");
+        if rows == vec![vec!["0".to_string()]] {
+            gone = true;
+            break;
+        }
+    }
+    assert!(gone, "abandoned transaction was never rolled back");
+
+    // Under multi-writer the foreign session could always write anyway; prove
+    // the abandoned transaction left no trace and both commits coexist.
+    query(&mut c2, "BEGIN;");
+    query(&mut c2, "INSERT INTO owned VALUES (2);");
+    query(&mut c2, "COMMIT;");
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM owned;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+}
+
+#[test]
+fn failed_statement_keeps_only_its_own_session_transaction_open() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE fail_t (id INTEGER, v TEXT);");
+
+    // Owner: BEGIN, one successful insert, then a failing statement.
+    query(&mut c1, "BEGIN;");
+    query(&mut c1, "INSERT INTO fail_t VALUES (1, 'ok');");
+    let err = query_result(&mut c1, "INSERT INTO fail_t VALUES (2);").unwrap_err();
+    assert!(err.contains("has 2 columns"), "unexpected error: {err}");
+
+    // Statement failure does not end this session's transaction: its earlier
+    // write is still visible to it.
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM fail_t;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    // R4-MULTIWRITER: a foreign writer is unaffected either way — it commits
+    // on its own disjoint row while the owner's transaction stays open.
+    let mut c2 = connect(port);
+    query(&mut c2, "INSERT INTO fail_t VALUES (3, 'foreign');");
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM fail_t;");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "owner snapshot stays pinned"
+    );
+
+    // ROLLBACK discards only the owner's row; the foreign write survives.
+    query(&mut c1, "ROLLBACK;");
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM fail_t;");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "rolled-back owner row must not survive"
+    );
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM fail_t;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+}
+
+#[test]
+fn two_sessions_hold_concurrent_transactions_and_commit_independently() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE flow (id INTEGER);");
+
+    // Session 1 acquires a writer transaction and inserts a row.
+    query(&mut c1, "BEGIN;");
+    query(&mut c1, "INSERT INTO flow VALUES (1);");
+
+    // R4-MULTIWRITER: session 2 may now BEGIN concurrently (no rejection).
+    let mut c2 = connect(port);
+    query(&mut c2, "BEGIN;");
+    query(&mut c2, "INSERT INTO flow VALUES (2);");
+
+    // Each session sees only its own uncommitted row.
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM flow;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM flow;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    // Commit in any order; both sessions' rows are durable and visible after
+    // both commits.
+    query(&mut c1, "COMMIT;");
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM flow;");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "c2 snapshot still pinned"
+    );
+    query(&mut c2, "COMMIT;");
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM flow;");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM flow;");
+    assert_eq!(rows, vec![vec!["2".to_string()]]);
+}
+
+#[test]
+fn handshaken_reader_never_observes_open_explicit_transaction() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE hand (id INTEGER, v TEXT);");
+    query(&mut c1, "CREATE INDEX ih ON hand (id);");
+    // A second table whose committed rows a JOIN can match against.
+    query(&mut c1, "CREATE TABLE grp (gid INTEGER);");
+    for i in 1..=101i64 {
+        query(&mut c1, &format!("INSERT INTO grp VALUES ({i});"));
+    }
+    query(&mut c1, "INSERT INTO hand VALUES (1, 'base');");
+
+    // Deterministic handshake: the writer session owns a live explicit
+    // transaction (buffered, uncommitted) while the reader session probes it.
+    let (begin_tx, begin_rx) = mpsc::channel::<()>();
+    let (gate_tx, gate_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+
+    let owner = std::thread::spawn(move || {
+        let mut co = connect(port);
+        query(&mut co, "BEGIN;");
+        let values: Vec<String> = (2..=101i64).map(|i| format!("({i}, 'tx{i}')")).collect();
+        query(
+            &mut co,
+            &format!("INSERT INTO hand VALUES {};", values.join(",")),
+        );
+        begin_tx.send(()).unwrap();
+        gate_rx.recv().unwrap();
+        query(&mut co, "COMMIT;");
+        done_tx.send(()).unwrap();
+    });
+
+    // Until the owner commits, the foreign reader must see committed state
+    // only — across the scan, an indexed lookup, GROUP BY and a JOIN.
+    begin_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM hand;");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "scan must stay committed-only mid-transaction"
+    );
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM hand WHERE id = 7;");
+    assert_eq!(
+        rows,
+        vec![vec!["0".to_string()]],
+        "index lookup must not leak a buffered row"
+    );
+    let rows = query(&mut c1, "SELECT v, COUNT(*) FROM hand GROUP BY v;");
+    assert_eq!(
+        rows,
+        vec![vec!["base".to_string(), "1".to_string()]],
+        "GROUP BY must not include buffered groups"
+    );
+    let rows = query(&mut c1, "SELECT id FROM hand JOIN grp ON id = gid;");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "JOIN must not expose buffered rows"
+    );
+
+    // Release the writer; after COMMIT the same reader sees everything.
+    gate_tx.send(()).unwrap();
+    done_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    owner.join().unwrap();
+
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM hand;");
+    assert_eq!(rows, vec![vec!["101".to_string()]]);
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM hand WHERE id = 7;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM hand GROUP BY v;");
+    assert_eq!(rows.len(), 101, "committed groups become visible");
+    let rows = query(&mut c1, "SELECT id FROM hand JOIN grp ON id = gid;");
+    assert_eq!(rows.len(), 101, "committed JOIN rows become visible");
+}
+
+#[test]
+fn wire_interleaved_multirow_explicit_writers_both_commit() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE mw (id INTEGER, owner TEXT);");
+
+    // Two sessions interleave multi-row INSERTs inside concurrent explicit
+    // transactions targeting the same table. Physical row ids come from the
+    // engine's shared counter, so every statement reserves a disjoint range:
+    // neither transaction ever blocks the other and both commit.
+    query(&mut c1, "BEGIN;");
+    query(&mut c1, "INSERT INTO mw VALUES (1, 'c1'), (2, 'c1');");
+    let mut c2 = connect(port);
+    query(&mut c2, "BEGIN;");
+    query(&mut c2, "INSERT INTO mw VALUES (100, 'c2'), (101, 'c2');");
+    query(&mut c1, "INSERT INTO mw VALUES (3, 'c1');");
+    query(&mut c2, "INSERT INTO mw VALUES (102, 'c2');");
+
+    // Each session sees its own rows only (snapshot isolation over writers).
+    let rows = query(&mut c1, "SELECT COUNT(*) FROM mw;");
+    assert_eq!(rows, vec![vec!["3".to_string()]]);
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM mw;");
+    assert_eq!(rows, vec![vec!["3".to_string()]]);
+
+    query(&mut c1, "COMMIT;");
+    query(&mut c2, "COMMIT;");
+
+    let rows = query(&mut c1, "SELECT id FROM mw ORDER BY id;");
+    let got: Vec<String> = rows.iter().map(|r| r[0].clone()).collect();
+    assert_eq!(
+        got,
+        vec!["1", "2", "3", "100", "101", "102"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>(),
+        "both sessions' interleaved rows committed exactly once"
+    );
+}
+
+#[test]
+fn rollback_in_one_wire_session_does_not_disturb_the_other() {
+    let port = start_server();
+    let mut c1 = connect(port);
+    query(&mut c1, "CREATE TABLE rb2 (id INTEGER, v TEXT);");
+
+    query(&mut c1, "BEGIN;");
+    query(&mut c1, "INSERT INTO rb2 VALUES (1, 'doomed');");
+    let mut c2 = connect(port);
+    query(&mut c2, "BEGIN;");
+    query(&mut c2, "INSERT INTO rb2 VALUES (2, 'kept');");
+
+    // The other session stays healthy throughout the first session's rollback.
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM rb2;");
+    assert_eq!(rows, vec![vec!["1".to_string()]]);
+
+    query(&mut c1, "ROLLBACK;");
+    let rows = query(&mut c2, "SELECT COUNT(*) FROM rb2;");
+    assert_eq!(
+        rows,
+        vec![vec!["1".to_string()]],
+        "session 2 unaffected by session 1's rollback"
+    );
+    query(&mut c2, "COMMIT;");
+    let rows = query(&mut c1, "SELECT id, v FROM rb2;");
+    assert_eq!(
+        rows,
+        vec![vec!["2".to_string(), "kept".to_string()]],
+        "only session 2's committed row survives"
+    );
 }

@@ -24,7 +24,7 @@ fn commit_batch(db: &Store, writes: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>
     let mut guard = db.write().unwrap();
     let (txn, _) = guard.begin();
     for (k, v) in writes {
-        guard.set(txn, &k, v);
+        guard.set(txn, &k, v).unwrap();
     }
     match guard.commit::<()>(txn, |_| Ok(())).unwrap() {
         Ok(()) => true,
@@ -219,7 +219,9 @@ fn wal_txn_ids_stay_monotonic_across_reader_watermarks() {
     for i in 0..100u64 {
         let txn: TxnId = i + 1;
         let mut guard = db.write().unwrap();
-        guard.set(txn, format!("r{i}").as_bytes(), vec![i as u8]);
+        guard
+            .set(txn, format!("r{i}").as_bytes(), vec![i as u8])
+            .unwrap();
         guard
             .commit::<()>(txn, |recs| {
                 let has_begin = recs
@@ -248,7 +250,7 @@ fn read_path_is_immutable_borrow() {
     }
     let mut s = MvccStore::new();
     let (t, _) = s.begin();
-    s.set(t, b"nope", vec![1]);
+    s.set(t, b"nope", vec![1]).unwrap();
     s.commit::<()>(t, |_| Ok(())).unwrap().unwrap();
     assert!(reads_only(&s) >= 1);
 }
