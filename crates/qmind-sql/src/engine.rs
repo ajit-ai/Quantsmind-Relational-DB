@@ -248,12 +248,15 @@ impl<W: Write> Engine<W> {
                 if_not_exists,
             } => self.create_table(name, columns, *if_not_exists),
             Statement::Insert { table, rows } => self.insert(session, table, rows),
-            Statement::Update { .. } => {
-                Err("execute: UPDATE is part of a later phase and is not yet implemented".into())
-            }
-            Statement::Delete { .. } => {
-                Err("execute: DELETE is part of a later phase and is not yet implemented".into())
-            }
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+            } => self.update(session, table, assignments, selection.as_ref()),
+            Statement::Delete {
+                table,
+                selection,
+            } => self.delete(session, table, selection.as_ref()),
             Statement::Select(sel) => {
                 let (snap, txn) = match self.active.get(&session) {
                     Some(a) => (a.snap, Some(a.txn)),
@@ -340,6 +343,182 @@ impl<W: Write> Engine<W> {
     /// Shared commit tail: WAL-group the transaction, publish MVCC versions,
     /// then materialize buffered rows into secondary indexes, columnar deltas
     /// and persistent pages — always after the WAL durability point.
+    /// Tombstone value written for a DELETE under the row key. It is a single
+    /// `0xFF` byte: every real row payload starts with a column tag ∈ {0,1,2}
+    /// (see [`encode_row`]), so no valid encoding ever begins with `0xFF` and
+    /// `decode_row` rejects it unconditionally. Scans (table + index + columnar
+    /// reconciliation) filter on `decode_row`'s `Option`, so the row vanishes
+    /// from every read path while the MVCC version chain still records the
+    /// tombstone — and the WAL `Put` carrying these bytes replays the DELETE
+    /// exactly, with no new WAL variant required.
+    const DELETED_ROW: [u8; 1] = [0xFF];
+
+    pub fn update(
+        &mut self,
+        session: SessionId,
+        table: &str,
+        assignments: &[parser::Assignment],
+        selection: Option<&parser::Expr>,
+    ) -> Result<ExecResult, String> {
+        let schema = self
+            .tables
+            .get(table)
+            .cloned()
+            .ok_or_else(|| format!("no table `{table}`"))?;
+        if assignments.is_empty() {
+            return Err("UPDATE requires at least one SET assignment".into());
+        }
+        let rid_max = *self.next_row_id.get(table).unwrap_or(&0);
+        let col_idx: Vec<usize> = assignments
+            .iter()
+            .map(|a| col_pos(&schema, &a.column))
+            .collect::<Result<_, String>>()?;
+
+        let mut buffered: Vec<BufferedRow> = Vec::new();
+        for rid in 0..rid_max {
+            let Some(raw) = self.db.read(None, &row_key(table, rid), &self.db.snapshot()) else {
+                continue; // never committed, or already deleted (tombstone)
+            };
+            let Some(mut row) = decode_row(&raw, &schema) else {
+                continue; // must be a tombstone — invisible to UPDATE
+            };
+            if let Some(sel) = selection {
+                if !is_true(&eval_expr(sel, &schema, &row)?)? {
+                    continue;
+                }
+            }
+            for (a, pos) in assignments.iter().zip(&col_idx) {
+                row[*pos] = literal_value(&a.value)?;
+            }
+            let encoded = encode_row(&row);
+            buffered.push(BufferedRow {
+                table: table.to_string(),
+                rid,
+                encoded: encoded.clone(),
+                values: row,
+            });
+        }
+        let count = buffered.len() as u64;
+        self.apply_mutations(session, buffered)?;
+        Ok(ExecResult {
+            columns: vec![],
+            rows: vec![],
+            rows_affected: count,
+        })
+    }
+
+    pub fn delete(
+        &mut self,
+        session: SessionId,
+        table: &str,
+        selection: Option<&parser::Expr>,
+    ) -> Result<ExecResult, String> {
+        let schema = self
+            .tables
+            .get(table)
+            .cloned()
+            .ok_or_else(|| format!("no table `{table}`"))?;
+        let rid_max = *self.next_row_id.get(table).unwrap_or(&0);
+        let mut buffered: Vec<BufferedRow> = Vec::new();
+        for rid in 0..rid_max {
+            let Some(raw) = self.db.read(None, &row_key(table, rid), &self.db.snapshot()) else {
+                continue;
+            };
+            let Some(row) = decode_row(&raw, &schema) else {
+                continue;
+            };
+            if let Some(sel) = selection {
+                if !is_true(&eval_expr(sel, &schema, &row)?)? {
+                    continue;
+                }
+            }
+            buffered.push(BufferedRow {
+                table: table.to_string(),
+                rid,
+                encoded: Self::DELETED_ROW.to_vec(),
+                values: row,
+            });
+        }
+        let count = buffered.len() as u64;
+        self.apply_mutations(session, buffered)?;
+        Ok(ExecResult {
+            columns: vec![],
+            rows: vec![],
+            rows_affected: count,
+        })
+    }
+
+    /// Shared autocommit/explicit mutation tail — exactly the INSERT write
+    /// discipline, reused for UPDATE/DELETE so every DML statement materializes
+    /// durable state through one path.
+    ///
+    /// 1. Inside an explicit transaction: reserve an exclusive write lock on
+    ///    every touched row key, buffer the new bytes in the session's pending
+    ///    kernel txn (read-your-own-writes, no partial statement state on
+    ///    failure), and return — MVCC visibility, WAL, indexes and columnar
+    ///    deltas all materialize at COMMIT via `finish_commit`.
+    /// 2. Autocommit: BEGIN a kernel txn, `set` the buffered rows (conflict or
+    ///    lock failure leaves no trace), then `commit` with the WAL group. WAL
+    ///    records are emitted before any new version publishes (write-ahead),
+    ///    and the group is fsynced once at the durability point.
+    fn apply_mutations(
+        &mut self,
+        session: SessionId,
+        buffered: Vec<BufferedRow>,
+    ) -> Result<(), String> {
+        if buffered.is_empty() {
+            return Ok(());
+        }
+        if let Some(act) = self.active.get_mut(&session) {
+            for b in &buffered {
+                self.db
+                    .lock_write(act.txn, &row_key(&b.table, b.rid))
+                    .map_err(|e| {
+                        format!(
+                            "statement failed: row locked by another transaction ({e:?})"
+                        )
+                    })?;
+            }
+            for b in &buffered {
+                self.db
+                    .set(act.txn, &row_key(&b.table, b.rid), b.encoded.clone())
+                    .expect("row key is already write-locked by this transaction");
+            }
+            act.buffered.extend(buffered);
+            return Ok(());
+        }
+
+        let (txn, _snap) = self.db.begin();
+        for b in &buffered {
+            if let Err(e) = self.db.set(txn, &row_key(&b.table, b.rid), b.encoded.clone()) {
+                self.db.abort(txn);
+                return Err(format!(
+                    "statement failed: row locked by another transaction ({e:?})"
+                )
+                .into());
+            }
+        }
+        let logged = self
+            .db
+            .commit(txn, |recs| {
+                for rec in recs {
+                    self.wal.append(rec);
+                }
+                self.wal
+                    .commit_group()
+                    .map(|_| ())
+                    .map_err(|e| format!("wal failure: {e:?}"))
+            })
+            .map_err(|e| format!("wal failure: {e}"))?;
+        match logged {
+            Ok(()) => self
+                .finish_commit(txn, buffered)
+                .map(|_| ())
+                .map_err(|e| e),
+            Err(_) => Err("concurrent update/delete conflict".into()),
+        }
+    }
+
     fn finish_commit(&mut self, txn: TxnId, buffered: Vec<BufferedRow>) -> Result<u64, String> {
         let logged = self
             .db
