@@ -60,6 +60,15 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    Update {
+        table: String,
+        assignments: Vec<Assignment>,
+        selection: Option<Expr>,
+    },
+    Delete {
+        table: String,
+        selection: Option<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +82,12 @@ pub struct Column {
 pub enum DataType {
     Integer,
     Text,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assignment {
+    pub column: String,
+    pub value: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +225,9 @@ const KEYWORDS: &[(&str, &str)] = &[
     ("ROLLBACK", "ROLLBACK"),
     ("TRANSACTION", "TRANSACTION"),
     ("WORK", "WORK"),
+    ("UPDATE", "UPDATE"),
+    ("SET", "SET"),
+    ("DELETE", "DELETE"),
 ];
 
 pub fn tokenize(sql: &str) -> Result<Vec<Token>, String> {
@@ -408,6 +426,8 @@ impl Parser {
             Token::Keyword("BEGIN") => self.parse_begin(),
             Token::Keyword("COMMIT") => self.parse_commit(),
             Token::Keyword("ROLLBACK") => self.parse_rollback(),
+            Token::Keyword("UPDATE") => self.parse_update(),
+            Token::Keyword("DELETE") => self.parse_delete(),
             t => Err(format!("unsupported statement, got {t:?}")),
         }
     }
@@ -422,6 +442,45 @@ impl Parser {
             self.advance();
         }
         Ok(Statement::Begin)
+    }
+
+    fn parse_assignment(&mut self) -> Result<Assignment, String> {
+        let column = self.expect_ident()?;
+        let eq = self.advance();
+        if eq != Token::Eq {
+            return Err(format!("expected '=', got {eq:?}"));
+        }
+        let value = self.parse_expr()?;
+        Ok(Assignment { column, value })
+    }
+
+    fn parse_update(&mut self) -> Result<Statement, String> {
+        self.expect_keyword("UPDATE")?;
+        let table = self.expect_ident()?;
+        self.expect_keyword("SET")?;
+        let assignments = self.parse_comma_separated(Self::parse_assignment)?;
+        let mut selection = None;
+        if self.peek() == &Token::Keyword("WHERE") {
+            self.advance();
+            selection = Some(self.parse_expr()?);
+        }
+        Ok(Statement::Update {
+            table,
+            assignments,
+            selection,
+        })
+    }
+
+    fn parse_delete(&mut self) -> Result<Statement, String> {
+        self.expect_keyword("DELETE")?;
+        self.expect_keyword("FROM")?;
+        let table = self.expect_ident()?;
+        let mut selection = None;
+        if self.peek() == &Token::Keyword("WHERE") {
+            self.advance();
+            selection = Some(self.parse_expr()?);
+        }
+        Ok(Statement::Delete { table, selection })
     }
 
     fn parse_commit(&mut self) -> Result<Statement, String> {
@@ -1017,6 +1076,118 @@ mod tests {
                 assert_eq!(rows[0][1], Expr::Literal(SqlValue::Text("a".into())));
             }
             other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_no_where() {
+        let stmts = Parser::parse("UPDATE users SET name = 'Alice'").unwrap();
+        match &stmts[0] {
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+            } => {
+                assert_eq!(table, "users");
+                assert_eq!(assignments.len(), 1);
+                assert_eq!(assignments[0].column, "name");
+                assert!(matches!(
+                    &assignments[0].value,
+                    Expr::Literal(SqlValue::Text(v)) if v == "Alice"
+                ));
+                assert!(selection.is_none());
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_with_where() {
+        let stmts = Parser::parse("UPDATE users SET name = 'Alice' WHERE id = 10").unwrap();
+        match &stmts[0] {
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+            } => {
+                assert_eq!(table, "users");
+                assert_eq!(assignments.len(), 1);
+                assert!(selection.is_some());
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_multiple_assignments_preserve_order() {
+        let stmts =
+            Parser::parse("UPDATE users SET name = 'Alice', age = 30 WHERE id = 10").unwrap();
+        match &stmts[0] {
+            Statement::Update { assignments, .. } => {
+                assert_eq!(assignments.len(), 2);
+                assert_eq!(assignments[0].column, "name");
+                assert_eq!(assignments[1].column, "age");
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_expression_rhs() {
+        let stmts = Parser::parse("UPDATE users SET age = age + 1 WHERE id = 10").unwrap();
+        match &stmts[0] {
+            Statement::Update { assignments, .. } => {
+                assert!(matches!(
+                    &assignments[0].value,
+                    Expr::BinaryOp { op: BinOp::Add, .. }
+                ));
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_delete_no_where() {
+        let stmts = Parser::parse("DELETE FROM users").unwrap();
+        match &stmts[0] {
+            Statement::Delete { table, selection } => {
+                assert_eq!(table, "users");
+                assert!(selection.is_none());
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_delete_with_where() {
+        let stmts = Parser::parse("DELETE FROM users WHERE id = 10").unwrap();
+        match &stmts[0] {
+            Statement::Delete { table, selection } => {
+                assert_eq!(table, "users");
+                assert!(selection.is_some());
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_update_and_delete_rejected() {
+        let bad = [
+            "UPDATE",
+            "UPDATE users",
+            "UPDATE users SET",
+            "UPDATE users SET name",
+            "UPDATE users SET = 'Alice'",
+            "UPDATE users SET name =",
+            "UPDATE users SET name = 'Alice',",
+            "UPDATE users SET name = 'Alice' WHERE",
+            "DELETE",
+            "DELETE users",
+            "DELETE FROM",
+            "DELETE FROM users WHERE",
+        ];
+        for sql in bad {
+            assert!(Parser::parse(sql).is_err(), "expected error for {sql:?}");
         }
     }
 

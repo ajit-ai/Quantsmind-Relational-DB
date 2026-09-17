@@ -248,6 +248,12 @@ impl<W: Write> Engine<W> {
                 if_not_exists,
             } => self.create_table(name, columns, *if_not_exists),
             Statement::Insert { table, rows } => self.insert(session, table, rows),
+            Statement::Update { .. } => {
+                Err("execute: UPDATE is part of a later phase and is not yet implemented".into())
+            }
+            Statement::Delete { .. } => {
+                Err("execute: DELETE is part of a later phase and is not yet implemented".into())
+            }
             Statement::Select(sel) => {
                 let (snap, txn) = match self.active.get(&session) {
                     Some(a) => (a.snap, Some(a.txn)),
