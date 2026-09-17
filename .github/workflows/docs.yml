@@ -31,6 +31,12 @@ jobs:
   build:
     name: Build Sphinx docs
     runs-on: ubuntu-latest
+    # Required so the build job can initialize the Pages environment and upload
+    # the special "github-pages" artifact that actions/deploy-pages@v4 consumes.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -44,7 +50,15 @@ jobs:
       - name: Build HTML
         run: sphinx-build -W -b html docs docs/_build/html
 
-      - name: Upload HTML artifact
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/_build/html
+
+      - name: Upload HTML artifact (collaborators)
         uses: actions/upload-artifact@v4
         with:
           name: docs-html
@@ -54,8 +68,6 @@ jobs:
   deploy:
     name: Deploy to GitHub Pages
     needs: build
-    # Only runs when explicitly requested via workflow_dispatch + publish=true.
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
     permissions:
       contents: read
       pages: write
