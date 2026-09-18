@@ -390,12 +390,39 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>, String> {
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Extended-protocol bound parameters (None for the Describe/counting
+    /// path, where `$n` must stay a placeholder; Some collapses `$n` to a
+    /// literal at bind time so the executor never sees Param).
+    params: Option<Vec<SqlValue>>,
 }
 
 impl Parser {
+    /// Parse on the simple-Query path. `$n` stays `Expr::Param(n)`: the engine
+    /// rejects unbound parameters with an explicit error rather than a panic.
     pub fn parse(sql: &str) -> Result<Vec<Statement>, String> {
+        Parser::parse_inner(sql, None)
+    }
+
+    /// Parse on the extended-protocol Execute path. Every `$n` is resolved to
+    /// the nth (`1`-based) bound value at bind time; out-of-range or unbound
+    /// indices fail here, never during evaluation.
+    pub fn parse_with_params(
+        sql: &str,
+        params: &[SqlValue],
+    ) -> Result<Vec<Statement>, String> {
+        Parser::parse_inner(sql, Some(params.to_vec()))
+    }
+
+    fn parse_inner(
+        sql: &str,
+        params: Option<Vec<SqlValue>>,
+    ) -> Result<Vec<Statement>, String> {
         let tokens = tokenize(sql)?;
-        let mut p = Parser { tokens, pos: 0 };
+        let mut p = Parser {
+            tokens,
+            pos: 0,
+            params,
+        };
         let mut stmts = Vec::new();
 
         while !p.at_end() {
@@ -990,7 +1017,20 @@ impl Parser {
             }
             Token::Param(n) => {
                 self.advance();
-                Ok(Expr::Param(n))
+                // Extended-protocol Bind: if a value for `$n` was supplied,
+                // resolve it to a literal here so the AST is fully
+                // self-contained when the engine evaluates it. Without bound
+                // values the placeholder survives (`Expr::Param`) so Describe
+                // can still count parameters and emit ParameterDescription.
+                match &self.params {
+                    Some(vals) => match vals.get(n as usize - 1) {
+                        Some(v) => Ok(Expr::Literal(v.clone())),
+                        None => Err(format!(
+                            "parameter ${n} is not supplied by this Bind message"
+                        )),
+                    },
+                    None => Ok(Expr::Param(n)),
+                }
             }
             Token::Str(s) => {
                 self.advance();
