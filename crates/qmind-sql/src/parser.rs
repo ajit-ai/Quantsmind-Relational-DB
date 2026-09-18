@@ -13,6 +13,8 @@ pub enum Token {
     Ident(String),
     Int(i64),
     Str(String),
+    // `$n` extended-protocol parameter placeholder (1-based)
+    Param(u32),
     // punctuation
     LParen,
     RParen,
@@ -148,6 +150,10 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// Extended-protocol `$n` parameter (1-based). The wire Bind message
+    /// supplies the value; prepared statements never reach evaluation with an
+    /// unresolved placeholder.
+    Param(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +355,27 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>, String> {
                 } else {
                     tokens.push(Token::Ident(word));
                 }
+            }
+            // Extended-protocol parameter placeholder `$n` (1-based). The lexer
+            // treats `$` + digits as a parameter marker; `$0` and non-digit
+            // suffixes are rejected so typos surface at parse, not at bind.
+            '$' => {
+                i += 1;
+                let start = i;
+                while i < len && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if start == i {
+                    return Err("expected parameter number after '$'".into());
+                }
+                let num_str: String = chars[start..i].iter().collect();
+                let n: u32 = num_str
+                    .parse()
+                    .map_err(|_| format!("invalid parameter number: {num_str}"))?;
+                if n == 0 {
+                    return Err(format!("parameter numbers are 1-based, got $0"));
+                }
+                tokens.push(Token::Param(n));
             }
             other => return Err(format!("unexpected character: '{other}'")),
         }
@@ -960,6 +987,10 @@ impl Parser {
             Token::Int(n) => {
                 self.advance();
                 Ok(Expr::Literal(SqlValue::Int(n)))
+            }
+            Token::Param(n) => {
+                self.advance();
+                Ok(Expr::Param(n))
             }
             Token::Str(s) => {
                 self.advance();

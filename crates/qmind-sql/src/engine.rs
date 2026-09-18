@@ -2216,6 +2216,10 @@ pub fn eval_expr(expr: &Expr, schema: &[ColumnDef], row: &[SqlValue]) -> Result<
                 .ok_or_else(|| format!("row missing column {id}"))
         }
         Expr::Literal(v) => Ok(v.clone()),
+        Expr::Param(n) => Err(format!(
+            "unbound parameter ${n}: the extended protocol Bind message must \
+             supply a value before Execute (Phase A s1)"
+        )),
         Expr::Unary {
             op: UnaryOp::Neg,
             expr,
@@ -2459,6 +2463,7 @@ pub fn format_expr(e: &Expr) -> String {
             let rendered: Vec<String> = args.iter().map(format_expr).collect();
             format!("{fname}({})", rendered.join(", "))
         }
+        Expr::Param(n) => format!("${n}"),
     }
 }
 
@@ -2522,6 +2527,7 @@ fn grouped_order_index(e: &Expr, out_cols: &[String]) -> Result<usize, String> {
 fn literal_value(expr: &Expr) -> Result<SqlValue, String> {
     match expr {
         Expr::Literal(v) => Ok(v.clone()),
+        Expr::Param(_) => Err("unbound parameter: Bind did not supply a value".into()),
         other => Err(format!("unsupported literal {other:?}")),
     }
 }
