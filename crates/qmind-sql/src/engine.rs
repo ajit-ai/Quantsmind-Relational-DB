@@ -222,7 +222,26 @@ impl<W: Write> Engine<W> {
     /// locks — is independent of every other session's, so two sessions can
     /// write, roll back and commit concurrently without interfering.
     pub fn execute_session(&mut self, session: SessionId, sql: &str) -> Result<ExecResult, String> {
-        let stmts = parser::Parser::parse(sql)?;
+        self.execute_session_params(session, sql, &[])
+    }
+
+    /// Extended-protocol execute: parse `sql` with `$n` placeholders resolved
+    /// to the `params` bound by the preceding Bind message (and passed
+    /// 1-based), then run the self-contained statement through the exact same
+    /// dispatch used by the simple-Query path. An empty slice is the
+    /// simple-protocol fast path and keeps behavior identical to
+    /// [`execute_session`](Self::execute_session).
+    pub fn execute_session_params(
+        &mut self,
+        session: SessionId,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> Result<ExecResult, String> {
+        let stmts = if params.is_empty() {
+            parser::Parser::parse(sql)?
+        } else {
+            parser::Parser::parse_with_params(sql, params)?
+        };
         if stmts.len() != 1 {
             return Err(format!(
                 "expected exactly one statement, got {}",
