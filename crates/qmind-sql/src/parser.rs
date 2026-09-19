@@ -373,7 +373,7 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>, String> {
                     .parse()
                     .map_err(|_| format!("invalid parameter number: {num_str}"))?;
                 if n == 0 {
-                    return Err(format!("parameter numbers are 1-based, got $0"));
+                    return Err("parameter numbers are 1-based, got $0".into());
                 }
                 tokens.push(Token::Param(n));
             }

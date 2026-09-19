@@ -513,8 +513,7 @@ impl<W: Write> Engine<W> {
                 self.db.abort(txn);
                 return Err(format!(
                     "statement failed: row locked by another transaction ({e:?})"
-                )
-                .into());
+                ));
             }
         }
         let logged = self
@@ -530,10 +529,7 @@ impl<W: Write> Engine<W> {
             })
             .map_err(|e| format!("wal failure: {e}"))?;
         match logged {
-            Ok(()) => self
-                .finish_commit(txn, buffered)
-                .map(|_| ())
-                .map_err(|e| e),
+            Ok(()) => self.finish_commit(txn, buffered).map(|_| ()),
             Err(_) => Err("concurrent update/delete conflict".into()),
         }
     }
